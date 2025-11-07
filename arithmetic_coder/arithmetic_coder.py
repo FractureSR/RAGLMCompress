@@ -139,8 +139,10 @@ class _CoderBase:
                 "Cumulative sum of probabilities exceeds 1 after quantisation. "
                 "Please make sure that sum(pdf) <= 1.0 - eps, for a small eps > 0."
             )
-        # return self._low + qcpdf
-        return np.array([int(self._low + val) for val in qcpdf], dtype=object)
+        
+        qcpdf = qcpdf.astype(object)
+        return self._low + qcpdf
+        # return np.array([int(self._low + val) for val in qcpdf], dtype=object)
 
     # 当待压缩的数据非常长时，因为精度问题，最终的数可能非常小，导致超出计算机对小数的表示范围，
     # 反应在区间上就是可能导致区间的下界和上界是重合的，因为下界和上界都超出了精度表示范围,
