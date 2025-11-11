@@ -16,7 +16,7 @@ class RAGCompressionConfig:
     
     # Storage paths
     RETRIEVER_STORAGE_PATH = "retriever_cache/wikipedia-qwen3_embedding_0.6B-storage"
-    TEST_SAMPLE_PATH = "./test_sample.txt"
+    TEST_SAMPLE_PATH = "datasets/test_workflow/test_sample.txt"
     
     # Model paths
     EMBEDDING_MODEL_NAME = "pretrained/Qwen3-Embedding-0.6B"

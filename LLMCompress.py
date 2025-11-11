@@ -20,7 +20,7 @@ class LLMCompressionConfig:
     
     # Dataset paths
     DATASET_PATH = "datasets/cosmopedia-100k"
-    TEST_SAMPLE_PATH = "./test_sample.txt"
+    TEST_SAMPLE_PATH = "datasets/test_workflow/test_sample.txt"
     
     # Output paths
     COMPRESSED_OUTPUT = "compressed.bin"
