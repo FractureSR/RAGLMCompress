@@ -13,6 +13,8 @@ from LLMCompress import write_padded_bytes, read_padded_bytes, Metric
 import os
 import sys
 from bmp_utils import split_bmp_to_patches, merge_patches_to_bmp
+import wave
+import struct
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -22,7 +24,7 @@ class CompressionConfig:
     """Configuration for bGPT compression"""
     # Model paths
     MODEL_CHECKPOINT_IMAGE = "./pretrained/bgpt/weights-image.pth"
-    MODEL_CHECKPOINT_AUDIO = "./pretrained/bgpt/weights_audio.pth"
+    MODEL_CHECKPOINT_AUDIO = "./pretrained/bgpt/weights-audio.pth"
     
     # Dataset paths
     DATASET_IMAGE = "datasets/clic_2024/bmp/*.bmp"
@@ -48,10 +50,13 @@ class CompressionConfig:
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     
     # Data type (for automatic path selection)
-    DATA_TYPE = "image"  # or "audio"
+    DATA_TYPE = "audio"  # or "image"
     
     # BMP splitting parameters
     BMP_PATCH_SIZE = 32  # Size of square patches for BMP splitting
+    
+    # Audio splitting parameters
+    AUDIO_CHUNK_DURATION = 1.0  # Duration of each audio chunk in seconds
     
     @classmethod
     def get_model_checkpoint(cls):
@@ -329,6 +334,97 @@ def write_bytes(filename, bytes_list):
     byte_array = bytearray(bytes_list)
     with open(filename, "wb") as f:
         f.write(byte_array)
+
+
+def split_wav_to_chunks(wav_file, output_folder, chunk_duration=1.0):
+    """
+    Split a WAV file into chunks of specified duration.
+    
+    :param wav_file: path to input WAV file
+    :param output_folder: folder to save chunks
+    :param chunk_duration: duration of each chunk in seconds
+    :return: tuple of (list of chunk file paths, WAV parameters dict)
+    """
+    # Read WAV file
+    with wave.open(wav_file, 'rb') as wav:
+        params = wav.getparams()
+        n_channels = params.nchannels
+        sampwidth = params.sampwidth
+        framerate = params.framerate
+        n_frames = params.nframes
+        
+        # Calculate chunk size in frames
+        chunk_frames = int(framerate * chunk_duration)
+        
+        # Read all frames
+        frames = wav.readframes(n_frames)
+    
+    # Create output folder
+    filename = os.path.basename(wav_file)
+    name_without_ext = os.path.splitext(filename)[0]
+    chunk_folder = os.path.join(output_folder, name_without_ext)
+    os.makedirs(chunk_folder, exist_ok=True)
+    
+    # Split into chunks
+    chunk_files = []
+    chunk_idx = 0
+    
+    bytes_per_frame = n_channels * sampwidth
+    total_bytes = len(frames)
+    chunk_bytes = chunk_frames * bytes_per_frame
+    
+    for start_byte in range(0, total_bytes, chunk_bytes):
+        end_byte = min(start_byte + chunk_bytes, total_bytes)
+        chunk_data = frames[start_byte:end_byte]
+        
+        # Save chunk
+        chunk_filename = f"chunk_{chunk_idx:04d}.wav"
+        chunk_path = os.path.join(chunk_folder, chunk_filename)
+        
+        with wave.open(chunk_path, 'wb') as chunk_wav:
+            chunk_wav.setparams(params)
+            chunk_wav.writeframes(chunk_data)
+        
+        chunk_files.append(chunk_path)
+        chunk_idx += 1
+    
+    # Store WAV parameters for reconstruction
+    wav_params = {
+        'nchannels': n_channels,
+        'sampwidth': sampwidth,
+        'framerate': framerate,
+        'comptype': params.comptype,
+        'compname': params.compname,
+    }
+    
+    return chunk_files, wav_params
+
+
+def merge_wav_chunks(chunk_files, output_path, wav_params):
+    """
+    Merge WAV chunks back into a single WAV file.
+    
+    :param chunk_files: list of chunk file paths (in order)
+    :param output_path: path for output merged WAV file
+    :param wav_params: WAV parameters dict from split_wav_to_chunks
+    """
+    # Read all chunks
+    all_frames = []
+    
+    for chunk_file in sorted(chunk_files):
+        with wave.open(chunk_file, 'rb') as chunk_wav:
+            frames = chunk_wav.readframes(chunk_wav.getnframes())
+            all_frames.append(frames)
+    
+    # Merge and write
+    with wave.open(output_path, 'wb') as output_wav:
+        output_wav.setnchannels(wav_params['nchannels'])
+        output_wav.setsampwidth(wav_params['sampwidth'])
+        output_wav.setframerate(wav_params['framerate'])
+        output_wav.setcomptype(wav_params['comptype'], wav_params['compname'])
+        
+        for frames in all_frames:
+            output_wav.writeframes(frames)
 
 
 def load_bgpt_model(checkpoint_path, device):
@@ -674,8 +770,224 @@ def test_bmp_compression(
     
     print(f"\nBMP compression test completed!")
     print(f"Reconstructed images saved to: {output_folder}")
-    print(f"Total compression ratio: {total_metric.compute_ratio()[1]:.6f}")
-    print(f"Total compression rate: {total_metric.compute_ratio()[0]:.6f} bits/byte")
+    print("Compression ratio/rate:", total_metric.compute_ratio())
+
+
+def test_audio_compression(
+    model,
+    device,
+    test: bool = False,
+    temp_folder: str = "temp_audio",
+    output_folder: str = "output_audio",
+    chunk_duration: float = None,
+):
+    """
+    Test audio file (WAV) compression and decompression workflow.
+    
+    This function:
+    1. Splits each WAV file into chunks (e.g., 1 second each)
+    2. Compresses each chunk separately
+    3. Decompresses each chunk
+    4. Merges chunks back into the original audio
+    5. Verifies the reconstructed audio matches the original
+    
+    :param model: bGPT model for compression
+    :param device: torch device
+    :param test: whether to use test dataset (from CompressionConfig)
+    :param temp_folder: temporary folder for intermediate files
+    :param output_folder: folder for final output
+    :param chunk_duration: duration of each audio chunk in seconds (default from config)
+    """
+    if chunk_duration is None:
+        chunk_duration = CompressionConfig.AUDIO_CHUNK_DURATION
+    
+    # Temporarily switch to audio mode to get correct paths
+    original_data_type = CompressionConfig.DATA_TYPE
+    CompressionConfig.DATA_TYPE = "audio"
+    
+    # Get dataset path from config
+    dataset_path = CompressionConfig.get_dataset_path(test=test)
+    
+    # Find all WAV files
+    wav_files = glob(dataset_path)
+    
+    if not wav_files:
+        print(f"No WAV files found in {dataset_path}")
+        CompressionConfig.DATA_TYPE = original_data_type  # Restore
+        return
+    
+    print(f"Found {len(wav_files)} WAV files to test")
+    print(f"Dataset path: {dataset_path}")
+    print(f"Chunk duration: {chunk_duration} seconds")
+    print("=" * 80)
+    
+    # Create necessary folders
+    os.makedirs(temp_folder, exist_ok=True)
+    os.makedirs(output_folder, exist_ok=True)
+    
+    split_folder = os.path.join(temp_folder, "split")
+    compressed_folder = os.path.join(temp_folder, "compressed")
+    decompressed_folder = os.path.join(temp_folder, "decompressed")
+    
+    os.makedirs(split_folder, exist_ok=True)
+    os.makedirs(compressed_folder, exist_ok=True)
+    os.makedirs(decompressed_folder, exist_ok=True)
+    
+    total_metric = Metric()
+    
+    for wav_file in wav_files:
+        print(f"\nProcessing: {os.path.basename(wav_file)}")
+        print("-" * 80)
+        
+        filename = os.path.basename(wav_file)
+        name_without_ext = os.path.splitext(filename)[0]
+        
+        # Step 1: Split WAV into chunks
+        print(f"Step 1: Splitting WAV into {chunk_duration}s chunks...")
+        chunk_files, wav_params = split_wav_to_chunks(
+            wav_file,
+            split_folder,
+            chunk_duration=chunk_duration
+        )
+        print(f"Created {len(chunk_files)} chunks")
+        print(f"WAV parameters: {wav_params['nchannels']} channels, "
+              f"{wav_params['sampwidth']} bytes/sample, "
+              f"{wav_params['framerate']} Hz")
+        
+        # Step 2: Compress each chunk
+        print(f"\nStep 2: Compressing {len(chunk_files)} chunks...")
+        compressed_info = {}  # Store compression info for each chunk
+        
+        for chunk_file in tqdm(chunk_files, desc="Compressing chunks"):
+            chunk_name = os.path.basename(chunk_file)
+            chunk_id = os.path.splitext(chunk_name)[0]
+            
+            # Read chunk bytes
+            bytes_list, ext = read_bytes(chunk_file)
+            
+            # Prepare input
+            padded_segment = pad_input_for_bgpt([bytes_list], [ext], device)
+            
+            metric = Metric()
+            
+            with torch.inference_mode():
+                attention_mask = padded_segment["masks"]
+                input_ids = padded_segment["patches"]
+                output = model(patches=input_ids, masks=attention_mask)
+                logits = output.logits
+                
+                # Process logits
+                logits = logits[:-1, :-1, :]
+                logits = logits.reshape(1, -1, 257)
+                
+                # Prepare input_ids
+                start_patch = input_ids[:, :CompressionConfig.PATCH_SIZE].squeeze(0)
+                input_ids = input_ids[:, CompressionConfig.PATCH_SIZE:-CompressionConfig.PATCH_SIZE]
+                input_ids = torch.cat(
+                    [torch.tensor([[256]], device=device), input_ids], dim=1
+                )
+            
+            # Compress
+            compressed_bytes, num_padded_bits, _, sequence_array, pd, probs = (
+                bgpt_compress(input_ids, logits, metric=metric)
+            )
+            
+            # Save compressed data
+            compressed_path = os.path.join(compressed_folder, f"{name_without_ext}_{chunk_id}.bin")
+            original_length = input_ids.shape[1] - 1
+            write_padded_bytes(compressed_path, compressed_bytes, num_padded_bits, original_length)
+            
+            # Store info for decompression
+            compressed_info[chunk_id] = {
+                'compressed_path': compressed_path,
+                'start_patch': start_patch,
+                'ext': ext,
+                'original_length': original_length,
+            }
+            
+            total_metric.accumulate(metric.compressed_length, metric.total_length)
+        
+        print("Compression ratop/rate:", total_metric.compute_ratio())
+        
+        # Step 3: Decompress each chunk
+        print(f"\nStep 3: Decompressing {len(chunk_files)} chunks...")
+        
+        decompressed_subfolder = os.path.join(decompressed_folder, name_without_ext)
+        os.makedirs(decompressed_subfolder, exist_ok=True)
+        
+        decompressed_chunk_files = []
+        
+        for chunk_id in tqdm(sorted(compressed_info.keys()), desc="Decompressing chunks"):
+            info = compressed_info[chunk_id]
+            
+            # Read compressed data
+            compressed_bytes, num_padded_bits, original_length = read_padded_bytes(
+                info['compressed_path']
+            )
+            
+            # Decompress
+            decompressed_tensor = bgpt_decode(
+                compressed_bytes,
+                num_padded_bits,
+                model,
+                info['start_patch'],
+                info['ext'],
+                device,
+                original_length,
+                do_test=False,
+            )
+            
+            # Convert tensor to bytes and save
+            decompressed_bytes = decompressed_tensor.squeeze(0).cpu().numpy().tolist()
+            decompressed_path = os.path.join(decompressed_subfolder, f"{chunk_id}.wav")
+            write_bytes(decompressed_path, decompressed_bytes)
+            decompressed_chunk_files.append(decompressed_path)
+        
+        # Step 4: Merge chunks back to original audio
+        print(f"\nStep 4: Merging chunks back to original audio...")
+        reconstructed_path = os.path.join(output_folder, f"reconstructed_{filename}")
+        merge_wav_chunks(
+            decompressed_chunk_files,
+            reconstructed_path,
+            wav_params
+        )
+        
+        # Step 5: Verify reconstruction
+        print(f"\nStep 5: Verifying reconstruction...")
+        original_bytes, _ = read_bytes(wav_file)
+        reconstructed_bytes, _ = read_bytes(reconstructed_path)
+        
+        # Remove padding from both
+        while original_bytes and original_bytes[-1] == 256:
+            original_bytes = original_bytes[:-1]
+        while reconstructed_bytes and reconstructed_bytes[-1] == 256:
+            reconstructed_bytes = reconstructed_bytes[:-1]
+        
+        if original_bytes == reconstructed_bytes:
+            print(f"✓ Reconstruction successful! Files match perfectly.")
+            print(f"  File size: {len(original_bytes)} bytes")
+        else:
+            print(f"✗ Warning: Reconstructed file differs from original")
+            print(f"  Original size: {len(original_bytes)} bytes")
+            print(f"  Reconstructed size: {len(reconstructed_bytes)} bytes")
+            
+            # Find first difference
+            min_len = min(len(original_bytes), len(reconstructed_bytes))
+            for i in range(min_len):
+                if original_bytes[i] != reconstructed_bytes[i]:
+                    print(f"  First difference at byte {i}: {original_bytes[i]} vs {reconstructed_bytes[i]}")
+                    break
+        
+        print("=" * 80)
+    
+    # Restore original data type
+    CompressionConfig.DATA_TYPE = original_data_type
+    
+    # Print overall statistics
+    print(f"\nAudio compression test completed!")
+    print(f"Total files processed: {len(wav_files)}")
+    print(f"Reconstructed audio files saved to: {output_folder}")
+    print("Compression ratio/rate:", total_metric.compute_ratio())
 
 
 if __name__ == "__main__":
@@ -696,6 +1008,7 @@ if __name__ == "__main__":
     test_workflow(llm, dataset, device, CompressionConfig.COMPRESSED_OUTPUT)
     """
 
+    """
     # Option 2: Run BMP compression test
     print("\n" + "=" * 80)
     print("Running BMP Compression Test")
@@ -704,7 +1017,21 @@ if __name__ == "__main__":
         model=llm,
         device=device,
         test=True,  # Set to True to use TEST_DATASET_IMAGE
-        temp_folder="temp",
-        output_folder="output",
+        temp_folder="temp_img",
+        output_folder="output_img",
         patch_size=CompressionConfig.BMP_PATCH_SIZE
+    )
+    """
+
+    # Option 3: Run Audio compression test with chunking
+    print("\n" + "=" * 80)
+    print("Running Audio Compression Test (with chunking)")
+    print("=" * 80)
+    test_audio_compression(
+        model=llm,
+        device=device,
+        test=True,  # Set to True to use TEST_DATASET_AUDIO
+        temp_folder="temp_audio",
+        output_folder="output_audio",
+        chunk_duration=CompressionConfig.AUDIO_CHUNK_DURATION,  # 1.0 second chunks
     )
