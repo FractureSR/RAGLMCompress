@@ -3,8 +3,8 @@ import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from typing import List, Dict, Any, Optional
-from naive_rag import SimpleRagRetriever
-from LLMCompress import Metric, compress
+from utils.naive_rag import SimpleRagRetriever
+from evaluation.LLMCompress import Metric, compress
 
 
 # ==================== Configuration ====================

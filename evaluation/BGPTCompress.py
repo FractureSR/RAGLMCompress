@@ -9,10 +9,10 @@ from glob import glob
 from bgpt.utils import bGPTLMHeadModel
 from bgpt.config import *
 from arithmetic_coder import ac_utils, arithmetic_coder
-from LLMCompress import write_padded_bytes, read_padded_bytes, Metric
+from evaluation.LLMCompress import write_padded_bytes, read_padded_bytes, Metric
 import os
 import sys
-from bmp_utils import split_bmp_to_patches, merge_patches_to_bmp
+from utils.bmp_utils import split_bmp_to_patches, merge_patches_to_bmp
 import wave
 import struct
 
