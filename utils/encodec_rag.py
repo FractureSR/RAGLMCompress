@@ -11,8 +11,8 @@ from tqdm import tqdm
 
 # ==================== Configuration ====================
 class EnCodecRAGConfig:
-    ENCODEC_MODEL = "facebook/encodec_16khz"
-    SAMPLE_RATE = 16000
+    ENCODEC_MODEL = "facebook/encodec_24khz"
+    SAMPLE_RATE = 24000
     # EnCodec 24kHz encoder outputs 128-channel features
     ENCODER_DIM = 128
     DEFAULT_PERSIST_PATH = "retriever_cache/audio_encodec_storage"

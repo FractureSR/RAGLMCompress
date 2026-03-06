@@ -16,6 +16,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torchaudio
+import librosa
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from glob import glob
@@ -39,8 +40,8 @@ from utils.encodec_rag import EnCodecRAGRetriever, EnCodecRAGConfig
 
 # ==================== Configuration ====================
 class Config:
-    ENCODEC_MODEL = "facebook/encodec_16khz"
-    ENCODEC_SAMPLE_RATE = 16000
+    ENCODEC_MODEL = "facebook/encodec_24khz"
+    ENCODEC_SAMPLE_RATE = 24000
     ENCODEC_DIM = 128          # EnCodec encoder output channels
     ENCODEC_BANDWIDTH = 6.0    # kbps; controls number of active codebooks
 
@@ -363,9 +364,10 @@ class AudioDataset(Dataset):
         # Pre-enumerate all (file, chunk_start) pairs
         self.samples: List[Tuple[str, int]] = []
         for path in file_paths:
-            info = torchaudio.info(path)
-            sr = info.sample_rate
-            n_frames = info.num_frames
+            # Use librosa to get audio metadata
+            sr = librosa.get_samplerate(path)
+            duration = librosa.get_duration(filename=path)
+            n_frames = int(duration * sr)
             # Number of complete chunks
             n_chunks = n_frames // int(sr * chunk_duration)
             for i in range(max(1, n_chunks)):

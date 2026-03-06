@@ -109,6 +109,182 @@ def convert_flac_folder_to_8k_wav(source_folder: str, output_folder: str, preser
     print(f"Errors: {error_count} files")
     print(f"Output location: {output_folder}")
 
+def convert_flac_to_16k_wav(input_path: str, output_path: str):
+    """
+    Convert a single FLAC file to 16000Hz, mono, 16-bit WAV.
+    
+    :param input_path: Path to input FLAC file
+    :param output_path: Path to save output WAV file
+    """
+    try:
+        # Load FLAC file
+        audio = AudioSegment.from_file(input_path, format="flac")
+        
+        # Convert to 8000Hz, mono, 16-bit
+        audio = audio.set_frame_rate(16000)
+        audio = audio.set_channels(1)
+        audio = audio.set_sample_width(1)
+        
+        # Create output directory if it doesn't exist
+        output_dir = os.path.dirname(output_path)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        
+        # Export as WAV
+        audio.export(output_path, format="wav")
+        
+    except Exception as e:
+        print(f"Error converting {input_path}: {e}")
+        raise
+
+
+def convert_flac_folder_to_16k_wav(source_folder: str, output_folder: str, preserve_structure: bool = True):
+    """
+    Convert all FLAC files in a folder (including subfolders) to 16000Hz, mono, 16-bit WAV files.
+    
+    :param source_folder: Root folder containing FLAC files
+    :param output_folder: Folder to save converted WAV files
+    :param preserve_structure: If True, preserve the folder structure; if False, flatten all files
+    """
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+    
+    # Find all FLAC files recursively
+    print("Searching for FLAC files...")
+    flac_files = find_all_flac_files(source_folder)
+    
+    if not flac_files:
+        print(f"No FLAC files found in {source_folder}")
+        return
+    
+    print(f"Found {len(flac_files)} FLAC files")
+    print(f"Converting to 16000Hz/16-bit/mono WAV...")
+    print(f"Source: {source_folder}")
+    print(f"Output: {output_folder}")
+    print(f"Preserve structure: {preserve_structure}")
+    print("=" * 60)
+    
+    success_count = 0
+    error_count = 0
+    
+    for filepath in tqdm(flac_files, desc="Converting"):
+        try:
+            # Get filename without extension
+            filename = os.path.basename(filepath)
+            name_without_ext = os.path.splitext(filename)[0]
+            
+            if preserve_structure:
+                # Preserve the folder structure
+                relative_path = os.path.relpath(filepath, source_folder)
+                relative_dir = os.path.dirname(relative_path)
+                output_subdir = os.path.join(output_folder, relative_dir)
+                output_path = os.path.join(output_subdir, f"{name_without_ext}.wav")
+            else:
+                # Flatten: put all files in the output folder
+                output_path = os.path.join(output_folder, f"{name_without_ext}.wav")
+            
+            # Convert
+            convert_flac_to_16k_wav(filepath, output_path)
+            success_count += 1
+            
+        except Exception as e:
+            error_count += 1
+            print(f"\nError processing {filename}: {e}")
+    
+    print("=" * 60)
+    print(f"Conversion complete!")
+    print(f"Success: {success_count} files")
+    print(f"Errors: {error_count} files")
+    print(f"Output location: {output_folder}")
+
+def convert_flac_to_32k_wav(input_path: str, output_path: str):
+    """
+    Convert a single FLAC file to 32000Hz, mono, 32-bit WAV.
+    
+    :param input_path: Path to input FLAC file
+    :param output_path: Path to save output WAV file
+    """
+    try:
+        # Load FLAC file
+        audio = AudioSegment.from_file(input_path, format="flac")
+        
+        # Convert to 8000Hz, mono, 16-bit
+        audio = audio.set_frame_rate(32000)
+        audio = audio.set_channels(1)
+        audio = audio.set_sample_width(1)
+        
+        # Create output directory if it doesn't exist
+        output_dir = os.path.dirname(output_path)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        
+        # Export as WAV
+        audio.export(output_path, format="wav")
+        
+    except Exception as e:
+        print(f"Error converting {input_path}: {e}")
+        raise
+
+
+def convert_flac_folder_to_32k_wav(source_folder: str, output_folder: str, preserve_structure: bool = True):
+    """
+    Convert all FLAC files in a folder (including subfolders) to 32000Hz, mono, 32-bit WAV files.
+    
+    :param source_folder: Root folder containing FLAC files
+    :param output_folder: Folder to save converted WAV files
+    :param preserve_structure: If True, preserve the folder structure; if False, flatten all files
+    """
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+    
+    # Find all FLAC files recursively
+    print("Searching for FLAC files...")
+    flac_files = find_all_flac_files(source_folder)
+    
+    if not flac_files:
+        print(f"No FLAC files found in {source_folder}")
+        return
+    
+    print(f"Found {len(flac_files)} FLAC files")
+    print(f"Converting to 32000Hz/32-bit/mono WAV...")
+    print(f"Source: {source_folder}")
+    print(f"Output: {output_folder}")
+    print(f"Preserve structure: {preserve_structure}")
+    print("=" * 60)
+    
+    success_count = 0
+    error_count = 0
+    
+    for filepath in tqdm(flac_files, desc="Converting"):
+        try:
+            # Get filename without extension
+            filename = os.path.basename(filepath)
+            name_without_ext = os.path.splitext(filename)[0]
+            
+            if preserve_structure:
+                # Preserve the folder structure
+                relative_path = os.path.relpath(filepath, source_folder)
+                relative_dir = os.path.dirname(relative_path)
+                output_subdir = os.path.join(output_folder, relative_dir)
+                output_path = os.path.join(output_subdir, f"{name_without_ext}.wav")
+            else:
+                # Flatten: put all files in the output folder
+                output_path = os.path.join(output_folder, f"{name_without_ext}.wav")
+            
+            # Convert
+            convert_flac_to_32k_wav(filepath, output_path)
+            success_count += 1
+            
+        except Exception as e:
+            error_count += 1
+            print(f"\nError processing {filename}: {e}")
+    
+    print("=" * 60)
+    print(f"Conversion complete!")
+    print(f"Success: {success_count} files")
+    print(f"Errors: {error_count} files")
+    print(f"Output location: {output_folder}")
+
 
 def extract_wav_segment(input_path: str, output_path: str, duration_seconds: float, start_time: float = 0.0):
     """
@@ -255,10 +431,10 @@ def get_audio_info(file_path: str):
 
 
 if __name__ == "__main__":
-    SOURCE_FOLDER = "datasets/LibriSpeech/dev-clean"
-    OUTPUT_FOLDER = "datasets/LibriSpeech/wav"
+    SOURCE_FOLDER = "./datasets/LibriSpeech/dev-clean"
+    OUTPUT_FOLDER = "./datasets/LibriSpeech/wav"
     
-    convert_flac_folder_to_8k_wav(
+    convert_flac_folder_to_32k_wav(
         source_folder=SOURCE_FOLDER,
         output_folder=OUTPUT_FOLDER,
         preserve_structure=False
