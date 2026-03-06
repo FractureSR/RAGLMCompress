@@ -2,7 +2,22 @@ import torch
 import random
 from .config import *
 from transformers import GPT2Model, GPT2LMHeadModel, PreTrainedModel
-from samplings import top_p_sampling, top_k_sampling, temperature_sampling
+
+# samplings is only needed for sampling-based generation, not for compression.
+# Make it optional so that inference/compression can run without installing it.
+try:
+    from samplings import top_p_sampling, top_k_sampling, temperature_sampling
+except ImportError:
+    def top_k_sampling(prob, top_k=0, return_probs=False):
+        return prob
+
+    def top_p_sampling(prob, top_p=1.0, return_probs=False):
+        return prob
+
+    def temperature_sampling(prob, temperature=1.0):
+        # Fallback: greedy argmax sampling
+        import numpy as np
+        return int(np.argmax(prob))
 
 class PatchLevelDecoder(PreTrainedModel):
     """

@@ -30,6 +30,8 @@ class CompressionConfig:
     DATASET_IMAGE = "datasets/clic_2024/bmp/*.bmp"
     DATASET_AUDIO = "datasets/librispeech/wav/*.wav"
     TEST_DATASET_IMAGE = "datasets/test_workflow/bmp/*.bmp"
+    # Tiny-ImageNet test set (after running scripts/jpeg-to-bmp-test-set.py)
+    TINY_IMAGENET_BMP = "datasets/tiny-imagenet-200/bmp/*.bmp"
     TEST_DATASET_AUDIO = "datasets/test_workflow/wav/*.wav"
     
     # Output paths
@@ -50,7 +52,7 @@ class CompressionConfig:
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     
     # Data type (for automatic path selection)
-    DATA_TYPE = "audio"  # or "image"
+    DATA_TYPE = "image"  # or "audio"
     
     # BMP splitting parameters
     BMP_PATCH_SIZE = 32  # Size of square patches for BMP splitting
@@ -64,8 +66,10 @@ class CompressionConfig:
         return cls.MODEL_CHECKPOINT_IMAGE if cls.DATA_TYPE == "image" else cls.MODEL_CHECKPOINT_AUDIO
     
     @classmethod
-    def get_dataset_path(cls, test: bool = False):
-        """Get dataset path based on data type"""
+    def get_dataset_path(cls, test: bool = False, use_tiny_imagenet: bool = False):
+        """Get dataset path based on data type. use_tiny_imagenet=True uses tiny-imagenet bmp for image test."""
+        if test and cls.DATA_TYPE == "image" and use_tiny_imagenet:
+            return cls.TINY_IMAGENET_BMP
         if test:
             return cls.TEST_DATASET_IMAGE if cls.DATA_TYPE == "image" else cls.TEST_DATASET_AUDIO
         else:
@@ -454,9 +458,14 @@ def load_bgpt_model(checkpoint_path, device):
     )
     llm = bGPTLMHeadModel(patch_config, byte_config)
 
-    checkpoint = torch.load(checkpoint_path)
-    # use this strict=False to tolerate transformers package version mismatch
-    llm.load_state_dict(checkpoint["model"], strict=False)
+    if os.path.isfile(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path)
+        # use this strict=False to tolerate transformers package version mismatch
+        llm.load_state_dict(checkpoint["model"], strict=False)
+        print(f"Loaded checkpoint from {checkpoint_path}")
+    else:
+        print(f"WARNING: checkpoint not found at {checkpoint_path}.")
+        print("Using randomly initialized bGPT model for testing the pipeline.")
     llm = llm.to(device)
     # llm = llm.to(torch.float16)
     llm.eval()
@@ -581,6 +590,7 @@ def test_bmp_compression(
     temp_folder: str = "temp",
     output_folder: str = "output",
     patch_size: int = None,
+    use_tiny_imagenet: bool = False,
 ):
     """
     Test BMP file compression and decompression workflow.
@@ -598,12 +608,13 @@ def test_bmp_compression(
     :param temp_folder: temporary folder for intermediate files
     :param output_folder: folder for final output
     :param patch_size: size of square patches for splitting BMP (default from config)
+    :param use_tiny_imagenet: if True, use datasets/tiny-imagenet-200/bmp/*.bmp as test set
     """
     if patch_size is None:
         patch_size = CompressionConfig.BMP_PATCH_SIZE
     
     # Get dataset path from config
-    dataset_path = CompressionConfig.get_dataset_path(test=test)
+    dataset_path = CompressionConfig.get_dataset_path(test=test, use_tiny_imagenet=use_tiny_imagenet)
     
     # Find all BMP files
     bmp_files = glob(dataset_path)
@@ -629,6 +640,7 @@ def test_bmp_compression(
     os.makedirs(decompressed_folder, exist_ok=True)
     
     total_metric = Metric()
+    results_log = []  # per-image stats for final summary
     
     for bmp_file in bmp_files:
         print(f"\nProcessing: {os.path.basename(bmp_file)}")
@@ -701,7 +713,7 @@ def test_bmp_compression(
             total_metric.accumulate(metric.compressed_length, metric.total_length)
         
         compress_rate, compress_ratio = total_metric.compute_ratio()
-        print("Compression ratio/rate:", total_metric.compute_ratio())
+        print(f"  [So far] Compression ratio: {compress_ratio:.4f}  rate: {compress_rate:.4f}")
         
         # Step 3: Decompress each patch
         print(f"\nStep 3: Decompressing {len(patch_files)} patches...")
@@ -752,7 +764,8 @@ def test_bmp_compression(
         while reconstructed_bytes and reconstructed_bytes[-1] == 256:
             reconstructed_bytes = reconstructed_bytes[:-1]
         
-        if original_bytes == reconstructed_bytes:
+        reconstruction_ok = (original_bytes == reconstructed_bytes)
+        if reconstruction_ok:
             print(f"✓ Reconstruction successful! Files match perfectly.")
         else:
             print(f"✗ Warning: Reconstructed file differs from original")
@@ -766,11 +779,59 @@ def test_bmp_compression(
                     print(f"  First difference at byte {i}: {original_bytes[i]} vs {reconstructed_bytes[i]}")
                     break
         
+        # Per-image stats for summary (compressed size = sum of .bin for this image)
+        img_original_bytes = len(original_bytes)
+        img_compressed_bytes = sum(
+            os.path.getsize(info["compressed_path"])
+            for info in compressed_info.values()
+        )
+        img_ratio = img_original_bytes / img_compressed_bytes if img_compressed_bytes else 0
+        results_log.append({
+            "filename": filename,
+            "original_bytes": img_original_bytes,
+            "compressed_bytes": img_compressed_bytes,
+            "ratio": img_ratio,
+            "reconstruction_ok": reconstruction_ok,
+        })
+        print(f"  [Result] {filename}: original={img_original_bytes} B, compressed={img_compressed_bytes} B, ratio={img_ratio:.4f}, match={reconstruction_ok}")
+        
         print("=" * 80)
     
-    print(f"\nBMP compression test completed!")
-    print(f"Reconstructed images saved to: {output_folder}")
-    print("Compression ratio/rate:", total_metric.compute_ratio())
+    # Final summary (stdout + file)
+    total_original = sum(r["original_bytes"] for r in results_log)
+    total_compressed = sum(r["compressed_bytes"] for r in results_log)
+    overall_ratio = total_original / total_compressed if total_compressed else 0
+    n_ok = sum(1 for r in results_log if r["reconstruction_ok"])
+    
+    summary_lines = [
+        "",
+        "=" * 80,
+        "Results summary",
+        "=" * 80,
+        f"Images processed: {len(results_log)}",
+        f"Reconstruction success: {n_ok}/{len(results_log)}",
+        f"Total original size: {total_original} bytes",
+        f"Total compressed size: {total_compressed} bytes",
+        f"Overall compression ratio: {overall_ratio:.4f}",
+        "",
+        "Per-image results:",
+    ]
+    for r in results_log:
+        summary_lines.append(
+            f"  {r['filename']}: {r['original_bytes']} B -> {r['compressed_bytes']} B, ratio={r['ratio']:.4f}, match={r['reconstruction_ok']}"
+        )
+    summary_lines.extend([
+        "",
+        f"Reconstructed images: {output_folder}/",
+        "=" * 80,
+    ])
+    summary_text = "\n".join(summary_lines)
+    print(summary_text)
+    
+    summary_path = os.path.join(output_folder, "results_summary.txt")
+    with open(summary_path, "w") as f:
+        f.write(summary_text)
+    print(f"\nSummary also written to: {summary_path}")
 
 
 def test_audio_compression(
@@ -1008,21 +1069,21 @@ if __name__ == "__main__":
     test_workflow(llm, dataset, device, CompressionConfig.COMPRESSED_OUTPUT)
     """
 
-    """
-    # Option 2: Run BMP compression test
+    # Option 2: Run BMP compression test (image modality; use tiny-imagenet after jpeg-to-bmp)
     print("\n" + "=" * 80)
-    print("Running BMP Compression Test")
+    print("Running BMP Compression Test (Image)")
     print("=" * 80)
     test_bmp_compression(
         model=llm,
         device=device,
-        test=True,  # Set to True to use TEST_DATASET_IMAGE
-        temp_folder="temp_img",
-        output_folder="output_img",
-        patch_size=CompressionConfig.BMP_PATCH_SIZE
+        test=True,
+        temp_folder="temp-img",
+        output_folder="output-img",
+        patch_size=CompressionConfig.BMP_PATCH_SIZE,
+        use_tiny_imagenet=True,  # Use datasets/tiny-imagenet-200/bmp/*.bmp
     )
-    """
 
+    """
     # Option 3: Run Audio compression test with chunking
     print("\n" + "=" * 80)
     print("Running Audio Compression Test (with chunking)")
@@ -1035,3 +1096,4 @@ if __name__ == "__main__":
         output_folder="output_audio",
         chunk_duration=CompressionConfig.AUDIO_CHUNK_DURATION,  # 1.0 second chunks
     )
+    """
