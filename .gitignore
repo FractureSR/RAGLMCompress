@@ -1,3 +1,19 @@
+# Model weights and large/generated data
 /pretrained
 /compressed.bin
 /datasets
+/temp-img
+/output-img
+
+# Baseline codec outputs (PNG/WebP/zstd); regenerate with docs/SETUP.md
+/baselines
+
+# SLURM job logs (keep repo clean for collaboration)
+slurm-*.out
+slurm-*.err
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.log
