@@ -39,8 +39,8 @@ from utils.encodec_rag import EnCodecRAGRetriever, EnCodecRAGConfig
 
 # ==================== Configuration ====================
 class Config:
-    ENCODEC_MODEL = "facebook/encodec_24khz"
-    ENCODEC_SAMPLE_RATE = 24000
+    ENCODEC_MODEL = "facebook/encodec_16khz"
+    ENCODEC_SAMPLE_RATE = 16000
     ENCODEC_DIM = 128          # EnCodec encoder output channels
     ENCODEC_BANDWIDTH = 6.0    # kbps; controls number of active codebooks
 
