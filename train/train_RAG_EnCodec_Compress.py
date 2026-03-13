@@ -13,6 +13,7 @@ Pipeline:
 
 import io
 import os
+import struct
 import numpy as np
 import torch
 import torch.nn as nn
@@ -624,9 +625,37 @@ def compress_audio_file(
     print(f"Compression ratio: {compress_ratio:.4f}  |  Rate: {compress_rate:.4f} bpb")
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    import pickle
     with open(output_path, "wb") as f:
-        pickle.dump(all_compressed, f)
+        # Binary container format:
+        # - 4 bytes magic: b"RAGA"
+        # - 1 byte version
+        # - 4 bytes chunk count
+        # Then for each chunk:
+        # - 4 bytes compressed payload length
+        # - 1 byte num_padded_bits
+        # - 4 bytes original_length
+        # - 2 bytes start_patch length
+        # - start_patch values as uint16
+        # - 2 bytes retrieved_path byte length
+        # - retrieved_path bytes (utf-8)
+        # - compressed payload bytes
+        f.write(b"RAGA")
+        f.write((1).to_bytes(1, "big"))
+        f.write(len(all_compressed).to_bytes(4, "big"))
+
+        for chunk in all_compressed:
+            data = chunk["data"]
+            start_patch = chunk["start_patch"]
+            retrieved_path = (chunk["retrieved_path"] or "").encode("utf-8")
+
+            f.write(len(data).to_bytes(4, "big"))
+            f.write(chunk["num_padded_bits"].to_bytes(1, "big"))
+            f.write(chunk["original_length"].to_bytes(4, "big"))
+            f.write(len(start_patch).to_bytes(2, "big"))
+            f.write(struct.pack(f">{len(start_patch)}H", *start_patch))
+            f.write(len(retrieved_path).to_bytes(2, "big"))
+            f.write(retrieved_path)
+            f.write(data)
 
     print(f"Saved compressed output to {output_path}")
     return compress_ratio, total_metric.compressed_length, total_metric.total_length
