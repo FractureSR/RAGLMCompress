@@ -11,15 +11,18 @@ Pipeline:
     → arithmetic coding      (compress using bGPT's byte probabilities)
 """
 
+import io
 import os
 import numpy as np
 import torch
 import torch.nn as nn
 import torchaudio
 import librosa
+import wave
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from glob import glob
+import librosa
 
 from transformers import (
     EncodecModel,
@@ -40,10 +43,10 @@ from utils.encodec_rag import EnCodecRAGRetriever, EnCodecRAGConfig
 
 # ==================== Configuration ====================
 class Config:
-    ENCODEC_MODEL = "facebook/encodec_24khz"
-    ENCODEC_SAMPLE_RATE = 24000
+    ENCODEC_MODEL = "facebook/encodec_32khz"
+    ENCODEC_SAMPLE_RATE = 32000
     ENCODEC_DIM = 128          # EnCodec encoder output channels
-    ENCODEC_BANDWIDTH = 6.0    # kbps; controls number of active codebooks
+    ENCODEC_BANDWIDTH = 2.2    # kbps; controls number of active codebooks
 
     # LoRA adapter (small GPT2 sitting on top of frozen EnCodec features)
     ADAPTER_N_EMBD = 128       # matches ENCODEC_DIM
@@ -57,7 +60,7 @@ class Config:
     BGPT_CHECKPOINT_AUDIO = "./pretrained/bgpt/weights-audio.pth"
     BGPT_PATCH_SIZE = PATCH_SIZE      # 16 bytes per patch
     BGPT_HIDDEN_SIZE = HIDDEN_SIZE    # 768
-    BGPT_PATCH_LENGTH = PATCH_LENGTH  # 1024
+    BGPT_PATCH_LENGTH = 512  # 1024
     BGPT_PATCH_NUM_LAYERS = PATCH_NUM_LAYERS
     BGPT_BYTE_NUM_LAYERS = BYTE_NUM_LAYERS
 
@@ -67,51 +70,129 @@ class Config:
 
     # Training
     SAMPLE_RATE = ENCODEC_SAMPLE_RATE
-    CHUNK_DURATION = 1.0      # seconds per audio chunk fed to the model
-    MAX_PATCHES = 512         # max patches per audio chunk for bGPT
+    CHUNK_DURATION = 0.1      # requested seconds per audio chunk, capped by bGPT byte budget
+    MAX_PATCHES = BGPT_PATCH_LENGTH - PREFIX_LENGTH
     TOP_K_RETRIEVAL = 1
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 # ==================== Audio Tokenizer ====================
-def encodec_audio_to_bytes(
-    encodec_model: EncodecModel,
-    waveform: torch.Tensor,
-    bandwidth: float = Config.ENCODEC_BANDWIDTH,
-) -> List[int]:
+def _wav_frames_to_mono_tensor(
+    frames: bytes,
+    n_channels: int,
+    sampwidth: int,
+    sample_rate: int,
+) -> torch.Tensor:
+    """Convert WAV PCM frames into a mono float tensor shaped [1, T]."""
+    dtype_map = {
+        1: np.uint8,
+        2: np.int16,
+        4: np.int32,
+    }
+    if sampwidth not in dtype_map:
+        raise ValueError(f"Unsupported sample width: {sampwidth}")
+
+    samples = np.frombuffer(frames, dtype=dtype_map[sampwidth])
+    if n_channels > 1:
+        samples = samples.reshape(-1, n_channels).mean(axis=1)
+
+    if sampwidth == 1:
+        samples = (samples.astype(np.float32) - 128.0) / 128.0
+    else:
+        scale = float(2 ** (8 * sampwidth - 1))
+        samples = samples.astype(np.float32) / scale
+
+    waveform = torch.from_numpy(samples).unsqueeze(0)
+    if sample_rate != Config.ENCODEC_SAMPLE_RATE:
+        waveform = torchaudio.functional.resample(
+            waveform, sample_rate, Config.ENCODEC_SAMPLE_RATE
+        )
+    return waveform
+
+
+def _build_wav_chunk_bytes(params: wave._wave_params, frames: bytes) -> bytes:
+    """Serialize a chunk of WAV frames back into a standalone WAV byte stream."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav_out:
+        wav_out.setnchannels(params.nchannels)
+        wav_out.setsampwidth(params.sampwidth)
+        wav_out.setframerate(params.framerate)
+        wav_out.setcomptype(params.comptype, params.compname)
+        wav_out.writeframes(frames)
+    return buf.getvalue()
+
+
+def _prepare_bgpt_audio_bytes(
+    file_bytes: bytes,
+    ext: str = "wav",
+    max_patches: int = Config.MAX_PATCHES,
+) -> Tuple[List[int], List[int]]:
     """
-    Tokenize audio with EnCodec and serialize RVQ codes to a flat byte list.
-
-    Each RVQ code is in [0, 1023], stored as a little-endian uint16 (2 bytes).
-    Codes are written codebook-interleaved: for each time frame t, write codes
-    for all codebooks in order, then advance to frame t+1.
-
-    waveform: [1, T]  (single channel, already at ENCODEC_SAMPLE_RATE)
-    returns: flat list of ints in [0, 255]
+    Format raw file bytes the same way bGPT audio expects:
+    one extension patch, payload patches, then one end patch.
     """
-    if waveform.dim() == 2:
-        waveform = waveform.unsqueeze(0)  # [1, 1, T]
-    waveform = waveform.to(next(encodec_model.parameters()).device)
+    ext_bytes = list(bytearray(ext, "utf-8"))[:PATCH_SIZE]
+    bos_patch = ext_bytes + [256] * (PATCH_SIZE - len(ext_bytes))
+    payload = list(file_bytes)
+    if len(payload) % PATCH_SIZE != 0:
+        payload += [256] * (PATCH_SIZE - len(payload) % PATCH_SIZE)
 
-    with torch.no_grad():
-        encoded = encodec_model.encode(waveform, bandwidth=bandwidth)
-    codes = encoded.audio_codes  # [1, num_codebooks, T_frames]
-    codes = codes.squeeze(0).cpu().numpy()  # [num_codebooks, T_frames]
+    bytes_list = bos_patch + payload + [256] * PATCH_SIZE
+    valid_patches = len(bytes_list) // PATCH_SIZE
+    if valid_patches > max_patches:
+        raise ValueError(
+            f"Chunk requires {valid_patches} patches, exceeds bGPT limit of {max_patches}. "
+            "Use a smaller audio chunk."
+        )
 
-    # Flatten codebook-interleaved: [T_frames, num_codebooks] → flat
-    codes_interleaved = codes.T.flatten()  # [T_frames * num_codebooks]
-    # Each code is uint16 (2 bytes, little-endian)
-    byte_data = codes_interleaved.astype(np.uint16).tobytes()
-    return list(byte_data)
+    patch_mask = [1] * valid_patches + [0] * (max_patches - valid_patches)
+    bytes_list += [256] * ((max_patches - valid_patches) * PATCH_SIZE)
+    return bytes_list, patch_mask
 
 
-def pad_bytes_to_patches(bytes_list: List[int], patch_size: int = Config.BGPT_PATCH_SIZE) -> List[int]:
-    """Pad byte list so its length is a multiple of patch_size (using value 256 as pad)."""
-    remainder = len(bytes_list) % patch_size
-    if remainder != 0:
-        bytes_list = bytes_list + [256] * (patch_size - remainder)
-    return bytes_list
+def _chunk_frame_budget(params: wave._wave_params, chunk_duration: float) -> int:
+    """
+    Compute a safe frame budget per chunk so the serialized WAV fits within bGPT.
+    """
+    requested_frames = max(1, int(params.framerate * chunk_duration))
+    max_payload_bytes = (Config.MAX_PATCHES - 2) * PATCH_SIZE
+    bytes_per_frame = params.nchannels * params.sampwidth
+
+    empty_chunk_bytes = len(_build_wav_chunk_bytes(params, b""))
+    available_frame_bytes = max_payload_bytes - empty_chunk_bytes
+    max_frames_by_bytes = max(1, available_frame_bytes // bytes_per_frame)
+    return min(requested_frames, max_frames_by_bytes)
+
+
+def load_wav_chunk(
+    path: str,
+    chunk_idx: int,
+    chunk_duration: float,
+) -> Dict[str, Any]:
+    """
+    Load a single chunk as both raw WAV bytes for bGPT and waveform for EnCodec RAG.
+    """
+    with wave.open(path, "rb") as wav_in:
+        params = wav_in.getparams()
+        chunk_frames = _chunk_frame_budget(params, chunk_duration)
+        wav_in.setpos(chunk_idx * chunk_frames)
+        frames = wav_in.readframes(chunk_frames)
+
+    chunk_bytes = _build_wav_chunk_bytes(params, frames)
+    waveform = _wav_frames_to_mono_tensor(
+        frames,
+        n_channels=params.nchannels,
+        sampwidth=params.sampwidth,
+        sample_rate=params.framerate,
+    )
+    bytes_list, patch_mask = _prepare_bgpt_audio_bytes(chunk_bytes, ext="wav")
+    return {
+        "bytes_list": bytes_list,
+        "patch_mask": patch_mask,
+        "waveform": waveform,
+        "params": params,
+    }
 
 
 # ==================== ConditionedPatchLevelDecoder ====================
@@ -150,16 +231,22 @@ class ConditionedPatchLevelDecoder(nn.Module):
             patch_embeds = torch.cat([prefix_embeds, patch_embeds], dim=1)
             if masks is not None:
                 prefix_mask = torch.ones(
-                    masks.shape[0], prefix_embeds.shape[1],
-                    device=masks.device, dtype=masks.dtype,
+                    masks.shape[0],
+                    prefix_embeds.shape[1],
+                    device=masks.device,
+                    dtype=masks.dtype,
                 )
                 masks = torch.cat([prefix_mask, masks], dim=1)
+
+        max_len = self.base.config.max_position_embeddings
+        patch_embeds = patch_embeds[:, :max_len, :]
+        if masks is not None:
+            masks = masks[:, :max_len]
 
         if masks is None:
             return self.base(inputs_embeds=patch_embeds)
         else:
             return self.base(inputs_embeds=patch_embeds, attention_mask=masks)
-
 
 # ==================== Main Model ====================
 class RAGEnCodecBGPT(nn.Module):
@@ -233,14 +320,15 @@ class RAGEnCodecBGPT(nn.Module):
         retrieved_waveform: [B, 1, T]
         returns: [B, T_enc, HIDDEN_SIZE]
         """
-        retrieved_waveform = retrieved_waveform.to(next(self.encodec.parameters()).device)
-        with torch.no_grad():
-            enc_out = self.encodec.encoder(retrieved_waveform)  # [B, D, T_enc]
-        enc_out = enc_out.transpose(1, 2)  # [B, T_enc, D]
+        device = retrieved_waveform.device
+        retrieved_waveform = retrieved_waveform.to(device)
 
-        # LoRA adapter expects inputs_embeds, not input_ids
+        with torch.no_grad():
+            enc_out = self.encodec.encoder(retrieved_waveform)
+
+        enc_out = enc_out.transpose(1, 2)
         ctx_feats = self.lora_adapter(inputs_embeds=enc_out.to(self.dtype)).last_hidden_state
-        ctx_embeds = self.context_bridge(ctx_feats)  # [B, T_enc, HIDDEN_SIZE]
+        ctx_embeds = self.context_bridge(ctx_feats)
         return ctx_embeds
 
     def forward(
@@ -250,7 +338,7 @@ class RAGEnCodecBGPT(nn.Module):
         retrieved_waveform: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         """
-        audio_patches:      [B, N_patches * PATCH_SIZE]  flat byte tokens (int64, values 0-256)
+        audio_patches:      [B, N_patches * PATCH_SIZE]  flat raw WAV bytes with bGPT BOS/EOS patches
         audio_masks:        [B, N_patches]                patch-level attention mask
         retrieved_waveform: [B, 1, T]                     retrieved similar audio
 
@@ -281,6 +369,9 @@ class RAGEnCodecBGPT(nn.Module):
 
         # 4. Drop prefix positions from encoded patches (causal: prefix already influenced audio)
         encoded_patches = encoded_patches[:, n_prefix:, :]  # [B, N_patches, H]
+        effective_patch_count = encoded_patches.shape[1]
+        audio_masks = audio_masks[:, :effective_patch_count]
+        audio_patches_2d = audio_patches_2d[:, :effective_patch_count, :]
 
         # 5. Byte-level decoding — replicate bGPT's masking logic
         left_shift_masks = audio_masks * (audio_masks.flip(1).cumsum(1).flip(1) > 1)
@@ -357,20 +448,17 @@ class AudioDataset(Dataset):
         self.encodec = encodec_model
         self.retriever = rag_retriever
         self.chunk_duration = chunk_duration
-        self.chunk_samples = int(Config.ENCODEC_SAMPLE_RATE * chunk_duration)
         self.max_patches = max_patches
         self.top_k = top_k
 
         # Pre-enumerate all (file, chunk_start) pairs
         self.samples: List[Tuple[str, int]] = []
         for path in file_paths:
-            # Use librosa to get audio metadata
-            sr = librosa.get_samplerate(path)
-            duration = librosa.get_duration(filename=path)
-            n_frames = int(duration * sr)
-            # Number of complete chunks
-            n_chunks = n_frames // int(sr * chunk_duration)
-            for i in range(max(1, n_chunks)):
+            with wave.open(path, "rb") as wav_in:
+                params = wav_in.getparams()
+                chunk_frames = _chunk_frame_budget(params, chunk_duration)
+                n_chunks = max(1, (params.nframes + chunk_frames - 1) // chunk_frames)
+            for i in range(n_chunks):
                 self.samples.append((path, i))
 
     def __len__(self) -> int:
@@ -378,55 +466,31 @@ class AudioDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         path, chunk_idx = self.samples[idx]
-
-        signal, sr = torchaudio.load(path)
-        if sr != Config.ENCODEC_SAMPLE_RATE:
-            signal = torchaudio.functional.resample(signal, sr, Config.ENCODEC_SAMPLE_RATE)
-        if signal.shape[0] > 1:
-            signal = signal.mean(dim=0, keepdim=True)
-
-        # Extract chunk
-        start = chunk_idx * self.chunk_samples
-        chunk = signal[:, start: start + self.chunk_samples]
-        if chunk.shape[-1] < self.chunk_samples:
-            # Pad short last chunk
-            pad = self.chunk_samples - chunk.shape[-1]
-            chunk = torch.nn.functional.pad(chunk, (0, pad))
-
-        # Tokenize chunk to bytes
-        bytes_list = encodec_audio_to_bytes(self.encodec, chunk)
-        bytes_list = pad_bytes_to_patches(bytes_list)
-
-        # Truncate to max_patches
-        max_bytes = self.max_patches * PATCH_SIZE
-        bytes_list = bytes_list[:max_bytes]
-        n_patches = len(bytes_list) // PATCH_SIZE
-
-        # Build patch mask
-        patch_mask = [1] * n_patches
-        # Pad to max_patches if needed
-        if n_patches < self.max_patches:
-            pad_patches = self.max_patches - n_patches
-            bytes_list = bytes_list + [256] * (pad_patches * PATCH_SIZE)
-            patch_mask = patch_mask + [0] * pad_patches
+        chunk_info = load_wav_chunk(path, chunk_idx, self.chunk_duration)
+        bytes_list = chunk_info["bytes_list"]
+        patch_mask = chunk_info["patch_mask"]
+        chunk = chunk_info["waveform"]
 
         # Retrieve similar audio
         results = self.retriever.retrieve(chunk, k=self.top_k)
         if results:
             retrieved_path = results[0]["path"]
-            retrieved_signal, rsr = torchaudio.load(retrieved_path)
+            retrieved_signal, rsr = librosa.load(retrieved_path, sr=None, mono=False)
+            retrieved_signal = torch.from_numpy(retrieved_signal).float()
+            if retrieved_signal.ndim == 1:
+                retrieved_signal = retrieved_signal.unsqueeze(0)
             if rsr != Config.ENCODEC_SAMPLE_RATE:
                 retrieved_signal = torchaudio.functional.resample(
                     retrieved_signal, rsr, Config.ENCODEC_SAMPLE_RATE
                 )
             if retrieved_signal.shape[0] > 1:
                 retrieved_signal = retrieved_signal.mean(dim=0, keepdim=True)
-            # Use same duration as chunk
-            if retrieved_signal.shape[-1] < self.chunk_samples:
-                pad = self.chunk_samples - retrieved_signal.shape[-1]
+            target_len = chunk.shape[-1]
+            if retrieved_signal.shape[-1] < target_len:
+                pad = target_len - retrieved_signal.shape[-1]
                 retrieved_signal = torch.nn.functional.pad(retrieved_signal, (0, pad))
             else:
-                retrieved_signal = retrieved_signal[:, : self.chunk_samples]
+                retrieved_signal = retrieved_signal[:, :target_len]
         else:
             # Fall back to the chunk itself if retrieval fails
             retrieved_signal = chunk
@@ -452,71 +516,88 @@ def compress_audio_file(
     """
     Compress a WAV file using RAGEnCodecBGPT + arithmetic coding.
     Saves compressed output to output_path.
+
+    Returns:
+        compress_ratio: float
+        compressed_len: int
+        original_len: int
     """
     from arithmetic_coder import ac_utils, arithmetic_coder
-    from evaluation.LLMCompress import write_padded_bytes, Metric
+    from evaluation.LLMCompress import Metric
 
     model.eval()
     model.to(device)
-    chunk_samples = int(Config.ENCODEC_SAMPLE_RATE * chunk_duration)
-
-    signal, sr = torchaudio.load(wav_path)
-    if sr != Config.ENCODEC_SAMPLE_RATE:
-        signal = torchaudio.functional.resample(signal, sr, Config.ENCODEC_SAMPLE_RATE)
-    if signal.shape[0] > 1:
-        signal = signal.mean(dim=0, keepdim=True)
 
     total_metric = Metric()
     all_compressed = []
 
-    n_chunks = max(1, signal.shape[-1] // chunk_samples)
-    for i in range(n_chunks):
-        chunk = signal[:, i * chunk_samples: (i + 1) * chunk_samples]
-        if chunk.shape[-1] < chunk_samples:
-            chunk = torch.nn.functional.pad(chunk, (0, chunk_samples - chunk.shape[-1]))
+    with wave.open(wav_path, "rb") as wav_in:
+        params = wav_in.getparams()
+        chunk_frames = _chunk_frame_budget(params, chunk_duration)
+        n_chunks = max(1, (params.nframes + chunk_frames - 1) // chunk_frames)
 
-        # Tokenize
-        bytes_list = encodec_audio_to_bytes(model.encodec, chunk)
-        bytes_list = pad_bytes_to_patches(bytes_list)
-        n_patches = len(bytes_list) // PATCH_SIZE
+    for i in range(n_chunks):
+        chunk_info = load_wav_chunk(wav_path, i, chunk_duration)
+        chunk = chunk_info["waveform"]
+        bytes_list = chunk_info["bytes_list"]
+        patch_mask = chunk_info["patch_mask"]
 
         audio_patches = torch.tensor(bytes_list, dtype=torch.long).unsqueeze(0).to(device)
-        audio_masks = torch.ones(1, n_patches, dtype=torch.long, device=device)
+        audio_masks = torch.tensor(patch_mask, dtype=torch.long).unsqueeze(0).to(device)
 
-        # Retrieve
         results = rag_retriever.retrieve(chunk, k=1)
         if results:
-            ret_signal, rsr = torchaudio.load(results[0]["path"])
+            ret_signal, rsr = librosa.load(results[0]["path"], sr=None, mono=False)
+            ret_signal = torch.from_numpy(ret_signal).float()
+
+            if ret_signal.ndim == 1:
+                ret_signal = ret_signal.unsqueeze(0)
+
             if rsr != Config.ENCODEC_SAMPLE_RATE:
-                ret_signal = torchaudio.functional.resample(ret_signal, rsr, Config.ENCODEC_SAMPLE_RATE)
+                ret_signal = torchaudio.functional.resample(
+                    ret_signal, rsr, Config.ENCODEC_SAMPLE_RATE
+                )
+
             if ret_signal.shape[0] > 1:
                 ret_signal = ret_signal.mean(dim=0, keepdim=True)
-            if ret_signal.shape[-1] < chunk_samples:
-                ret_signal = torch.nn.functional.pad(ret_signal, (0, chunk_samples - ret_signal.shape[-1]))
+
+            target_len = chunk.shape[-1]
+            if ret_signal.shape[-1] < target_len:
+                ret_signal = torch.nn.functional.pad(
+                    ret_signal, (0, target_len - ret_signal.shape[-1])
+                )
             else:
-                ret_signal = ret_signal[:, :chunk_samples]
+                ret_signal = ret_signal[:, :target_len]
         else:
             ret_signal = chunk
+
         retrieved_waveform = ret_signal.unsqueeze(0).to(device)
 
-        # Get logits
-        logits = model.get_logits_for_compression(audio_patches, audio_masks, retrieved_waveform)
-        # logits: [N_valid, PATCH_SIZE+1, 257]
-        logits = logits[:, :-1, :]  # drop last byte position in each patch
-        logits = logits.reshape(1, -1, 257)  # [1, N*PATCH_SIZE, 257]
+        logits = model.get_logits_for_compression(
+            audio_patches, audio_masks, retrieved_waveform
+        )
+        valid_patch_count = int(audio_masks.sum().item())
+        payload_patch_count = max(0, valid_patch_count - 2)
+        logits = logits[: payload_patch_count + 1, :-1, :]
+        logits = logits[:-1, :, :].reshape(1, -1, 257)
 
-        # Prepare input_ids for arithmetic coding
-        # Input ids = bytes excluding BOS patch, with leading dummy token
-        input_ids = audio_patches[:, PATCH_SIZE:-PATCH_SIZE] if n_patches > 2 else audio_patches
+        input_ids = audio_patches[:, PATCH_SIZE : (valid_patch_count - 1) * PATCH_SIZE]
         input_ids = torch.cat([torch.tensor([[256]], device=device), input_ids], dim=1)
 
-        # Arithmetic encode
         output_bits = []
         encoder = arithmetic_coder.Encoder(
             base=2, precision=precision, output_fn=output_bits.append
         )
+
         target = input_ids[:, prefix_length:].detach().cpu().numpy().reshape(-1)
-        probs_np = logits[:, prefix_length - 1:, :].softmax(dim=-1).detach().cpu().numpy().squeeze(0)
+        probs_np = (
+            logits[:, prefix_length - 1 :, :]
+            .softmax(dim=-1)
+            .detach()
+            .cpu()
+            .numpy()
+            .squeeze(0)
+        )
 
         for symbol, prob in zip(target, probs_np):
             encoder.encode(
@@ -526,19 +607,29 @@ def compress_audio_file(
 
         compressed_bits = "".join(map(str, output_bits))
         compressed_bytes, num_padded_bits = ac_utils.bits_to_bytes(compressed_bits)
+
         total_metric.accumulate(len(compressed_bytes), len(target))
-        all_compressed.append((compressed_bytes, num_padded_bits, len(target)))
+        start_patch = audio_patches[:, :PATCH_SIZE].squeeze(0).detach().cpu().tolist()
+        all_compressed.append(
+            {
+                "data": compressed_bytes,
+                "num_padded_bits": num_padded_bits,
+                "original_length": len(target),
+                "start_patch": start_patch,
+                "retrieved_path": results[0]["path"] if results else None,
+            }
+        )
 
     compress_rate, compress_ratio = total_metric.compute_ratio()
     print(f"Compression ratio: {compress_ratio:.4f}  |  Rate: {compress_rate:.4f} bpb")
 
-    # Save all chunks to output_path
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     import pickle
     with open(output_path, "wb") as f:
         pickle.dump(all_compressed, f)
+
     print(f"Saved compressed output to {output_path}")
-    return compress_ratio
+    return compress_ratio, total_metric.compressed_length, total_metric.total_length
 
 
 # ==================== Training ====================
@@ -554,7 +645,7 @@ def main():
                         default=Config.BGPT_CHECKPOINT_AUDIO)
     parser.add_argument("--output_dir", type=str, default="./rag_encodec_ckpt")
     parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--lr", type=float, default=2e-4)
     args = parser.parse_args()
 
@@ -601,17 +692,30 @@ def main():
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=4,
         learning_rate=args.lr,
-        bf16=torch.cuda.is_available(),
+        dataloader_num_workers=0,
+        dataloader_pin_memory=False,
+        bf16=False,
+        fp16=False,
         logging_steps=20,
-        save_steps=500,
         remove_unused_columns=False,
+        save_strategy="no",
     )
 
     def collate_fn(batch):
+        max_retrieved_len = max(b["retrieved_waveform"].shape[-1] for b in batch)
+        padded_retrieved = []
+        for item in batch:
+            waveform = item["retrieved_waveform"]
+            if waveform.shape[-1] < max_retrieved_len:
+                waveform = torch.nn.functional.pad(
+                    waveform, (0, max_retrieved_len - waveform.shape[-1])
+                )
+            padded_retrieved.append(waveform)
+
         return {
             "audio_patches": torch.stack([b["audio_patches"] for b in batch]),
             "audio_masks": torch.stack([b["audio_masks"] for b in batch]),
-            "retrieved_waveform": torch.stack([b["retrieved_waveform"] for b in batch]),
+            "retrieved_waveform": torch.stack(padded_retrieved),
         }
 
     trainer = Trainer(
@@ -620,10 +724,13 @@ def main():
         train_dataset=dataset,
         data_collator=collate_fn,
     )
-    trainer.train()
-    trainer.save_model(args.output_dir)
-    print(f"Training complete. Model saved to {args.output_dir}")
 
+    trainer.train()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    torch.save(model.state_dict(), os.path.join(args.output_dir, "pytorch_model.bin"))
+
+    print(f"Training complete. Model saved to {args.output_dir}")
 
 if __name__ == "__main__":
     main()

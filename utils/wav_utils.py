@@ -208,7 +208,7 @@ def convert_flac_to_32k_wav(input_path: str, output_path: str):
         # Load FLAC file
         audio = AudioSegment.from_file(input_path, format="flac")
         
-        # Convert to 8000Hz, mono, 16-bit
+        # Convert to 32000Hz, mono, 32-bit
         audio = audio.set_frame_rate(32000)
         audio = audio.set_channels(1)
         audio = audio.set_sample_width(1)
@@ -431,8 +431,8 @@ def get_audio_info(file_path: str):
 
 
 if __name__ == "__main__":
-    SOURCE_FOLDER = "./datasets/LibriSpeech/dev-clean"
-    OUTPUT_FOLDER = "./datasets/LibriSpeech/wav"
+    SOURCE_FOLDER = "./data/librispeech/test_workflow" 
+    OUTPUT_FOLDER = "./data/librispeech/test/wav"
     
     convert_flac_folder_to_32k_wav(
         source_folder=SOURCE_FOLDER,

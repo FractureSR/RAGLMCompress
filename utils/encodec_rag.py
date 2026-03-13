@@ -7,13 +7,13 @@ from typing import List, Dict, Any
 import torch
 from transformers import EncodecModel, AutoProcessor
 from tqdm import tqdm
-
+import librosa
 
 # ==================== Configuration ====================
 class EnCodecRAGConfig:
-    ENCODEC_MODEL = "facebook/encodec_24khz"
-    SAMPLE_RATE = 24000
-    # EnCodec 24kHz encoder outputs 128-channel features
+    ENCODEC_MODEL = "facebook/encodec_32khz"
+    SAMPLE_RATE = 32000
+    # EnCodec 32kHz encoder outputs 128-channel features
     ENCODER_DIM = 128
     DEFAULT_PERSIST_PATH = "retriever_cache/audio_encodec_storage"
     INDEX_FILENAME = "encodec_faiss_index.bin"
@@ -83,7 +83,10 @@ class EnCodecRAGRetriever:
         ids_to_add = []
 
         for path in tqdm(file_paths, desc="Indexing audio"):
-            signal, sr = torchaudio.load(path)
+            signal, sr = librosa.load(path, sr=None, mono=False)
+            signal = torch.from_numpy(signal).float()
+            if signal.ndim == 1:
+                signal = signal.unsqueeze(0)
             if sr != EnCodecRAGConfig.SAMPLE_RATE:
                 signal = torchaudio.functional.resample(signal, sr, EnCodecRAGConfig.SAMPLE_RATE)
             if signal.shape[0] > 1:
