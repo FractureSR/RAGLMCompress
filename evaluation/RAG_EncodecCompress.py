@@ -25,24 +25,24 @@ class RAGCompressionConfig:
     """Configuration for RAG-enhanced EnCodec + bGPT audio compression"""
 
     # Model paths
-    TRAINED_MODEL_CHECKPOINT = "./rag_encodec_ckpt"
+    TRAINED_MODEL_CHECKPOINT = "./rag_encodec_ckpt_3"
     BGPT_CHECKPOINT_AUDIO = "./pretrained/bgpt/weights-audio.pth"
 
     # Dataset paths
     RAG_AUDIO_DATASET = "./data/librispeech/wav/**/*.wav"
-    TEST_DATASET_AUDIO = "./data/test_workflow/wav/*.wav"
+    TEST_DATASET_AUDIO = "./data/LibriSpeech/test-clean-wav-flat/*.wav"
 
     # Retriever storage
-    RETRIEVER_STORAGE_PATH = "./retriever_cache/encodec"
+    RETRIEVER_STORAGE_PATH = "./retriever_cache/encodec_3"
 
     # Optional single-file test path
-    TEST_SAMPLE_PATH = "./data/librispeech/test/wav/5895-34629-0000.wav"
+    TEST_SAMPLE_PATH = "./data/LibriSpeech/test-clean-wav-flat/61-70968-0000.wav"
 
     # Output paths
     COMPRESSED_OUTPUT_DIR = "./output_rag_audio"
 
     # Retrieval parameters
-    TOP_K_RETRIEVAL = 1
+    TOP_K_RETRIEVAL = 5
 
     # Compression parameters
     NUM_FILES_TO_COMPRESS = 1
@@ -334,6 +334,7 @@ def compress_with_rag_context(
         chunk_duration=chunk_duration,
         precision=Config.PRECISION,
         prefix_length=Config.PREFIX_LENGTH,
+        top_k=RAGCompressionConfig.TOP_K_RETRIEVAL,
     )
 
     metric.accumulate(compressed_len, original_len)
@@ -356,6 +357,8 @@ def run_rag_audio_compression(
     )
 
     metric = Metric()
+    total_wav_original_size = 0
+    total_artifact_size = 0
 
     print("\n=== Starting Audio Compression ===")
     num_docs = len(audio_files)
@@ -379,13 +382,19 @@ def run_rag_audio_compression(
             verbose=verbose,
         )
 
+        wav_original_size = os.path.getsize(wav_path)
         artifact_size = os.path.getsize(compressed_path)
-        file_ratio = compressed_len / original_len if original_len else 0.0
+        token_space_ratio = compressed_len / original_len if original_len else 0.0
+        wav_ratio = wav_original_size / artifact_size if artifact_size else 0.0
 
-        per_file_ratios.append((wav_path, file_ratio))
+        total_wav_original_size += wav_original_size
+        total_artifact_size += artifact_size
+
+        per_file_ratios.append((wav_path, token_space_ratio, wav_ratio))
         print(f"\n✓ File {idx} compressed: {compressed_path}")
         print(f"✓ File token-stream compression ratio: {token_ratio:.6f}")
-        print(f"✓ File payload compression ratio: {file_ratio:.6f}")
+        print(f"✓ File payload compression ratio: {token_space_ratio:.6f}")
+        print(f"✓ File WAV-level artifact ratio: {wav_ratio:.6f}x")
         print(f"✓ Saved artifact size: {artifact_size} bytes")
 
     print("\n" + "=" * 60)
@@ -393,15 +402,24 @@ def run_rag_audio_compression(
     print("=" * 60)
 
     compression_rate, compression_ratio = metric.compute_ratio()
+    wav_level_ratio = (
+        total_wav_original_size / total_artifact_size if total_artifact_size else 0.0
+    )
 
-    print(f"Total original length: {metric.total_length} bytes")
-    print(f"Total compressed length: {metric.compressed_length} bytes")
-    print(f"Compression ratio: {compression_ratio:.6f}")
-    print(f"Compression rate: {compression_rate:.6f}x")
+    print(f"Total PCM-payload original length: {metric.total_length} bytes")
+    print(f"Total compressed payload length: {metric.compressed_length} bytes")
+    print(f"PCM-payload compression ratio: {compression_ratio:.6f}")
+    print(f"PCM-payload compression rate: {compression_rate:.6f}x")
+    print(f"Total WAV size: {total_wav_original_size} bytes")
+    print(f"Total artifact size: {total_artifact_size} bytes")
+    print(f"WAV-level artifact ratio: {wav_level_ratio:.6f}x")
 
-    print("\nPer-file payload ratios:")
-    for wav_path, ratio in per_file_ratios:
-        print(f"  {os.path.basename(wav_path)}: {ratio:.6f}")
+    print("\nPer-file ratios:")
+    for wav_path, token_ratio_value, wav_ratio in per_file_ratios:
+        print(
+            f"  {os.path.basename(wav_path)}: "
+            f"pcm={token_ratio_value:.6f}, wav={wav_ratio:.6f}x"
+        )
 
     print("=" * 60)
 
@@ -483,6 +501,7 @@ def test_audio_compression(
                 chunk_duration=chunk_duration,
                 precision=Config.PRECISION,
                 prefix_length=Config.PREFIX_LENGTH,
+                top_k=RAGCompressionConfig.TOP_K_RETRIEVAL,
             )
 
             total_metric.accumulate(compressed_len, original_len)

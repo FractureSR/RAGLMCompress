@@ -16,6 +16,7 @@ import os
 import struct
 import numpy as np
 import torch
+from tqdm import tqdm
 import torch.nn as nn
 import torchaudio
 import librosa
@@ -23,7 +24,6 @@ import wave
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from glob import glob
-import librosa
 
 from transformers import (
     EncodecModel,
@@ -44,16 +44,16 @@ from utils.encodec_rag import EnCodecRAGRetriever, EnCodecRAGConfig
 
 # ==================== Configuration ====================
 class Config:
-    ENCODEC_MODEL = "facebook/encodec_32khz"
-    ENCODEC_SAMPLE_RATE = 32000
+    ENCODEC_MODEL = "facebook/encodec_24khz"
+    ENCODEC_SAMPLE_RATE = 24000
     ENCODEC_DIM = 128          # EnCodec encoder output channels
-    ENCODEC_BANDWIDTH = 2.2    # kbps; controls number of active codebooks
+    ENCODEC_BANDWIDTH = 3.0    # kbps; controls number of active codebooks
 
     # LoRA adapter (small GPT2 sitting on top of frozen EnCodec features)
     ADAPTER_N_EMBD = 128       # matches ENCODEC_DIM
     ADAPTER_N_HEAD = 4
     ADAPTER_N_LAYER = 2
-    LORA_R = 16
+    LORA_R = 32
     LORA_ALPHA = 32
     LORA_DROPOUT = 0.05
 
@@ -68,12 +68,14 @@ class Config:
     # Compression
     PRECISION = 64
     PREFIX_LENGTH = 1
+    NUM_PREFIX_TOKENS = 64
+    PREFIX_POOL_HEADS = 4
 
     # Training
     SAMPLE_RATE = ENCODEC_SAMPLE_RATE
     CHUNK_DURATION = 0.1      # requested seconds per audio chunk, capped by bGPT byte budget
     MAX_PATCHES = BGPT_PATCH_LENGTH - PREFIX_LENGTH
-    TOP_K_RETRIEVAL = 1
+    TOP_K_RETRIEVAL = 5
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -112,30 +114,17 @@ def _wav_frames_to_mono_tensor(
     return waveform
 
 
-def _build_wav_chunk_bytes(params: wave._wave_params, frames: bytes) -> bytes:
-    """Serialize a chunk of WAV frames back into a standalone WAV byte stream."""
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wav_out:
-        wav_out.setnchannels(params.nchannels)
-        wav_out.setsampwidth(params.sampwidth)
-        wav_out.setframerate(params.framerate)
-        wav_out.setcomptype(params.comptype, params.compname)
-        wav_out.writeframes(frames)
-    return buf.getvalue()
-
-
-def _prepare_bgpt_audio_bytes(
-    file_bytes: bytes,
-    ext: str = "wav",
+def _prepare_pcm_audio_bytes(
+    pcm_bytes: bytes,
     max_patches: int = Config.MAX_PATCHES,
 ) -> Tuple[List[int], List[int]]:
     """
-    Format raw file bytes the same way bGPT audio expects:
-    one extension patch, payload patches, then one end patch.
+    Format raw PCM bytes for bGPT: one format patch, PCM payload patches, then one end patch.
+    This keeps the compression target lossless while avoiding WAV-container header bytes.
     """
-    ext_bytes = list(bytearray(ext, "utf-8"))[:PATCH_SIZE]
-    bos_patch = ext_bytes + [256] * (PATCH_SIZE - len(ext_bytes))
-    payload = list(file_bytes)
+    fmt_bytes = list(bytearray("pcm", "utf-8"))[:PATCH_SIZE]
+    bos_patch = fmt_bytes + [256] * (PATCH_SIZE - len(fmt_bytes))
+    payload = list(pcm_bytes)
     if len(payload) % PATCH_SIZE != 0:
         payload += [256] * (PATCH_SIZE - len(payload) % PATCH_SIZE)
 
@@ -152,17 +141,18 @@ def _prepare_bgpt_audio_bytes(
     return bytes_list, patch_mask
 
 
-def _chunk_frame_budget(params: wave._wave_params, chunk_duration: float) -> int:
+def _chunk_frame_budget(
+    params: wave._wave_params,
+    chunk_duration: float,
+    max_patches: int = Config.MAX_PATCHES,
+) -> int:
     """
-    Compute a safe frame budget per chunk so the serialized WAV fits within bGPT.
+    Compute a safe frame budget per chunk so the raw PCM payload fits within bGPT.
     """
     requested_frames = max(1, int(params.framerate * chunk_duration))
-    max_payload_bytes = (Config.MAX_PATCHES - 2) * PATCH_SIZE
+    max_payload_bytes = (max_patches - 2) * PATCH_SIZE
     bytes_per_frame = params.nchannels * params.sampwidth
-
-    empty_chunk_bytes = len(_build_wav_chunk_bytes(params, b""))
-    available_frame_bytes = max_payload_bytes - empty_chunk_bytes
-    max_frames_by_bytes = max(1, available_frame_bytes // bytes_per_frame)
+    max_frames_by_bytes = max(1, max_payload_bytes // bytes_per_frame)
     return min(requested_frames, max_frames_by_bytes)
 
 
@@ -170,30 +160,93 @@ def load_wav_chunk(
     path: str,
     chunk_idx: int,
     chunk_duration: float,
+    max_patches: int = Config.MAX_PATCHES,
 ) -> Dict[str, Any]:
     """
-    Load a single chunk as both raw WAV bytes for bGPT and waveform for EnCodec RAG.
+    Load a single chunk as exact PCM payload bytes for bGPT and waveform for EnCodec RAG.
     """
     with wave.open(path, "rb") as wav_in:
         params = wav_in.getparams()
-        chunk_frames = _chunk_frame_budget(params, chunk_duration)
+        chunk_frames = _chunk_frame_budget(
+            params,
+            chunk_duration,
+            max_patches=max_patches,
+        )
         wav_in.setpos(chunk_idx * chunk_frames)
         frames = wav_in.readframes(chunk_frames)
 
-    chunk_bytes = _build_wav_chunk_bytes(params, frames)
     waveform = _wav_frames_to_mono_tensor(
         frames,
         n_channels=params.nchannels,
         sampwidth=params.sampwidth,
         sample_rate=params.framerate,
     )
-    bytes_list, patch_mask = _prepare_bgpt_audio_bytes(chunk_bytes, ext="wav")
+    bytes_list, patch_mask = _prepare_pcm_audio_bytes(
+        frames,
+        max_patches=max_patches,
+    )
     return {
         "bytes_list": bytes_list,
         "patch_mask": patch_mask,
         "waveform": waveform,
         "params": params,
+        "pcm_num_bytes": len(frames),
     }
+
+
+def _load_retrieved_waveform(path: str, target_len: int) -> torch.Tensor:
+    retrieved_signal, rsr = librosa.load(path, sr=None, mono=False)
+    retrieved_signal = torch.from_numpy(retrieved_signal).float()
+    if retrieved_signal.ndim == 1:
+        retrieved_signal = retrieved_signal.unsqueeze(0)
+    if rsr != Config.ENCODEC_SAMPLE_RATE:
+        retrieved_signal = torchaudio.functional.resample(
+            retrieved_signal, rsr, Config.ENCODEC_SAMPLE_RATE
+        )
+    if retrieved_signal.shape[0] > 1:
+        retrieved_signal = retrieved_signal.mean(dim=0, keepdim=True)
+    if retrieved_signal.shape[-1] < target_len:
+        pad = target_len - retrieved_signal.shape[-1]
+        retrieved_signal = torch.nn.functional.pad(retrieved_signal, (0, pad))
+    else:
+        retrieved_signal = retrieved_signal[:, :target_len]
+    return retrieved_signal
+
+
+def _load_audio_file_waveform(path: str) -> torch.Tensor:
+    signal, sr = librosa.load(path, sr=None, mono=False)
+    signal = torch.from_numpy(signal).float()
+    if signal.ndim == 1:
+        signal = signal.unsqueeze(0)
+    if sr != Config.ENCODEC_SAMPLE_RATE:
+        signal = torchaudio.functional.resample(signal, sr, Config.ENCODEC_SAMPLE_RATE)
+    if signal.shape[0] > 1:
+        signal = signal.mean(dim=0, keepdim=True)
+    return signal
+
+
+def _aggregate_retrieved_waveforms(
+    results: List[Dict[str, Any]],
+    fallback_waveform: torch.Tensor,
+) -> Tuple[torch.Tensor, List[str]]:
+    if not results:
+        return fallback_waveform, []
+
+    target_len = fallback_waveform.shape[-1]
+    retrieved_signals = []
+    retrieved_paths: List[str] = []
+    for result in results:
+        try:
+            retrieved_signals.append(_load_retrieved_waveform(result["path"], target_len))
+            retrieved_paths.append(result["path"])
+        except Exception:
+            continue
+
+    if not retrieved_signals:
+        return fallback_waveform, []
+
+    stacked = torch.stack(retrieved_signals, dim=0)
+    return stacked.mean(dim=0), retrieved_paths
 
 
 # ==================== ConditionedPatchLevelDecoder ====================
@@ -252,14 +305,10 @@ class ConditionedPatchLevelDecoder(nn.Module):
 # ==================== Main Model ====================
 class RAGEnCodecBGPT(nn.Module):
     """
-    RAG-conditioned audio compressor.
+    RAG-conditioned lossless audio compressor over PCM byte patches.
 
-    Encoder path (trained):
-      retrieved audio → frozen EnCodec encoder → LoRA GPT2 adapter → context bridge
-                     → prefix embeddings for bGPT
-
-    Decoder path (frozen):
-      target audio bytes → bGPT patches + RAG prefix → byte-level logits → arithmetic coding
+    Retrieved audio is encoded with EnCodec into trainable prefix embeddings,
+    while the compression target remains the exact PCM byte stream.
     """
 
     def __init__(
@@ -274,13 +323,11 @@ class RAGEnCodecBGPT(nn.Module):
         super().__init__()
         self.dtype = dtype
 
-        # --- Frozen EnCodec (tokenizer + feature extractor) ---
         self.encodec = EncodecModel.from_pretrained(encodec_model_name)
         self.encodec.eval()
         for p in self.encodec.parameters():
             p.requires_grad = False
 
-        # --- LoRA transformer adapter on top of EnCodec encoder features ---
         adapter_cfg = GPT2Config(
             n_embd=Config.ADAPTER_N_EMBD,
             n_head=Config.ADAPTER_N_HEAD,
@@ -298,29 +345,41 @@ class RAGEnCodecBGPT(nn.Module):
         )
         self.lora_adapter = get_peft_model(base_adapter, lora_cfg)
 
-        # --- Context bridge: adapter dim → bGPT hidden size ---
         self.context_bridge = nn.Linear(
             Config.ADAPTER_N_EMBD, Config.BGPT_HIDDEN_SIZE, bias=False, dtype=dtype
         )
         nn.init.normal_(self.context_bridge.weight, std=0.02)
 
-        # --- Frozen bGPT ---
+        self.prefix_norm = nn.LayerNorm(Config.BGPT_HIDDEN_SIZE, dtype=dtype)
+        self.sep_embed = nn.Parameter(
+            torch.zeros(1, 1, Config.BGPT_HIDDEN_SIZE, dtype=dtype)
+        )
+        nn.init.normal_(self.sep_embed, std=0.02)
+
         self.bgpt = _load_bgpt(bgpt_checkpoint)
         for p in self.bgpt.parameters():
             p.requires_grad = False
-        self.bgpt.eval()
 
-        # --- Conditioned patch decoder (wraps bGPT's patch_level_decoder) ---
+        # Add LoRA to both bGPT decoders so they adapt to audio bytes
+        bgpt_lora_cfg = LoraConfig(
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            target_modules=["c_attn", "c_proj"],
+            bias="none",
+        )
+        self.bgpt.patch_level_decoder.base = get_peft_model(
+            self.bgpt.patch_level_decoder.base, bgpt_lora_cfg
+        )
+        self.bgpt.byte_level_decoder.base = get_peft_model(
+            self.bgpt.byte_level_decoder.base, bgpt_lora_cfg
+        )
+
         self.conditioned_patch_decoder = ConditionedPatchLevelDecoder(
             self.bgpt.patch_level_decoder
         )
 
     def encode_context(self, retrieved_waveform: torch.Tensor) -> torch.Tensor:
-        """
-        Encode retrieved audio into RAG context prefix embeddings.
-        retrieved_waveform: [B, 1, T]
-        returns: [B, T_enc, HIDDEN_SIZE]
-        """
         device = retrieved_waveform.device
         retrieved_waveform = retrieved_waveform.to(device)
 
@@ -332,49 +391,51 @@ class RAGEnCodecBGPT(nn.Module):
         ctx_embeds = self.context_bridge(ctx_feats)
         return ctx_embeds
 
+    def pool_context(self, ctx_embeds: torch.Tensor) -> torch.Tensor:
+        seq_len = ctx_embeds.shape[1]
+        if seq_len == 0:
+            raise ValueError("Context embeddings must contain at least one timestep.")
+
+        if seq_len == 1:
+            sampled = ctx_embeds.expand(-1, Config.NUM_PREFIX_TOKENS, -1)
+        else:
+            indices = torch.linspace(
+                0,
+                seq_len - 1,
+                steps=Config.NUM_PREFIX_TOKENS,
+                device=ctx_embeds.device,
+            ).round().long()
+            sampled = ctx_embeds.index_select(1, indices)
+        return self.prefix_norm(sampled)
+
     def forward(
         self,
         audio_patches: torch.Tensor,
         audio_masks: torch.Tensor,
         retrieved_waveform: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        """
-        audio_patches:      [B, N_patches * PATCH_SIZE]  flat raw WAV bytes with bGPT BOS/EOS patches
-        audio_masks:        [B, N_patches]                patch-level attention mask
-        retrieved_waveform: [B, 1, T]                     retrieved similar audio
-
-        returns: dict with 'loss' and 'logits'
-        """
-        B = audio_patches.shape[0]
+        bsz = audio_patches.shape[0]
         device = audio_patches.device
 
-        # 1. Encode retrieved audio → RAG prefix [B, T_enc, H]
         ctx_embeds = self.encode_context(retrieved_waveform)
-
-        # Pool encoder time dim to a fixed number of prefix patches
-        # Use a single mean-pooled patch for simplicity; can be extended to multiple
-        prefix_embeds = ctx_embeds.mean(dim=1, keepdim=True)  # [B, 1, H]
+        prefix_embeds = self.pool_context(ctx_embeds)
+        sep = self.sep_embed.expand(bsz, -1, -1).to(device=device, dtype=prefix_embeds.dtype)
+        prefix_embeds = torch.cat([prefix_embeds, sep], dim=1)
         n_prefix = prefix_embeds.shape[1]
 
-        # 2. Reshape audio patches for patch-level processing
-        audio_patches_2d = audio_patches.reshape(B, -1, PATCH_SIZE)  # [B, N, PATCH_SIZE]
-
-        # 3. Run conditioned patch-level decoder (injects RAG prefix)
+        audio_patches_2d = audio_patches.reshape(bsz, -1, PATCH_SIZE)
         out = self.conditioned_patch_decoder(
             patches=audio_patches_2d,
             masks=audio_masks,
             prefix_embeds=prefix_embeds.to(device),
         )
-        # last_hidden_state: [B, n_prefix + N_patches, H]
         encoded_patches = out["last_hidden_state"]
 
-        # 4. Drop prefix positions from encoded patches (causal: prefix already influenced audio)
-        encoded_patches = encoded_patches[:, n_prefix:, :]  # [B, N_patches, H]
+        encoded_patches = encoded_patches[:, n_prefix:, :]
         effective_patch_count = encoded_patches.shape[1]
         audio_masks = audio_masks[:, :effective_patch_count]
         audio_patches_2d = audio_patches_2d[:, :effective_patch_count, :]
 
-        # 5. Byte-level decoding — replicate bGPT's masking logic
         left_shift_masks = audio_masks * (audio_masks.flip(1).cumsum(1).flip(1) > 1)
         audio_masks_modified = audio_masks.clone()
         audio_masks_modified[:, 0] = 0
@@ -391,10 +452,6 @@ class RAGEnCodecBGPT(nn.Module):
         audio_masks: torch.Tensor,
         retrieved_waveform: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Returns byte-level logits for arithmetic coding.
-        Shape: [N_valid_patches, PATCH_SIZE+1, 257]
-        """
         with torch.inference_mode():
             out = self.forward(audio_patches, audio_masks, retrieved_waveform)
         return out["logits"]
@@ -429,11 +486,28 @@ def _load_bgpt(checkpoint_path: str) -> bGPTLMHeadModel:
     return model
 
 
+def _load_wav_paths(audio_dir: Optional[str] = None, audio_manifest: Optional[str] = None) -> List[str]:
+    if bool(audio_dir) == bool(audio_manifest):
+        raise ValueError("Provide exactly one of audio_dir or audio_manifest.")
+
+    if audio_manifest is not None:
+        with open(audio_manifest, "r", encoding="utf-8") as f:
+            paths = [line.strip() for line in f if line.strip()]
+        if not paths:
+            raise FileNotFoundError(f"No WAV paths found in manifest {audio_manifest}")
+        return paths
+
+    paths = sorted(glob(os.path.join(audio_dir, "**/*.wav"), recursive=True))
+    if not paths:
+        raise FileNotFoundError(f"No WAV files found in {audio_dir}")
+    return paths
+
+
 # ==================== Dataset ====================
 class AudioDataset(Dataset):
     """
-    Loads WAV files, chunks them, tokenizes with EnCodec, and returns
-    (byte_patches, patch_masks, retrieved_waveform) triples.
+    Loads WAV files, chunks them, and returns lossless PCM byte patches plus
+    EnCodec-based retrieved context.
     """
 
     def __init__(
@@ -444,6 +518,7 @@ class AudioDataset(Dataset):
         chunk_duration: float = Config.CHUNK_DURATION,
         max_patches: int = Config.MAX_PATCHES,
         top_k: int = Config.TOP_K_RETRIEVAL,
+        retrieval_cache_path: Optional[str] = None,
     ):
         self.file_paths = file_paths
         self.encodec = encodec_model
@@ -452,49 +527,59 @@ class AudioDataset(Dataset):
         self.max_patches = max_patches
         self.top_k = top_k
 
-        # Pre-enumerate all (file, chunk_start) pairs
         self.samples: List[Tuple[str, int]] = []
         for path in file_paths:
             with wave.open(path, "rb") as wav_in:
                 params = wav_in.getparams()
-                chunk_frames = _chunk_frame_budget(params, chunk_duration)
+                chunk_frames = _chunk_frame_budget(
+                    params,
+                    chunk_duration,
+                    max_patches=max_patches,
+                )
                 n_chunks = max(1, (params.nframes + chunk_frames - 1) // chunk_frames)
             for i in range(n_chunks):
                 self.samples.append((path, i))
+
+        # Pre-compute chunk-level retrievals once and optionally persist to disk
+        # so EnCodec inference is not repeated across training runs.
+        if retrieval_cache_path and os.path.exists(retrieval_cache_path):
+            print(f"Loading cached retrievals from {retrieval_cache_path}")
+            import pickle
+            with open(retrieval_cache_path, "rb") as f:
+                self.chunk_retrievals = pickle.load(f)
+            print(f"Loaded {len(self.chunk_retrievals)} cached retrievals.")
+        else:
+            print(f"Pre-computing retrievals for {len(self.samples)} chunks...")
+            self.chunk_retrievals: List[List[Dict[str, Any]]] = []
+            for path, chunk_idx in tqdm(self.samples, desc="Caching retrievals"):
+                chunk_info = load_wav_chunk(path, chunk_idx, chunk_duration, max_patches)
+                results = self.retriever.retrieve(chunk_info["waveform"], k=top_k)
+                self.chunk_retrievals.append(results)
+            if retrieval_cache_path:
+                import pickle
+                os.makedirs(os.path.dirname(retrieval_cache_path) or ".", exist_ok=True)
+                with open(retrieval_cache_path, "wb") as f:
+                    pickle.dump(self.chunk_retrievals, f)
+                print(f"Saved retrievals to {retrieval_cache_path}")
+            print("Retrieval pre-computation complete.")
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         path, chunk_idx = self.samples[idx]
-        chunk_info = load_wav_chunk(path, chunk_idx, self.chunk_duration)
+        chunk_info = load_wav_chunk(
+            path,
+            chunk_idx,
+            self.chunk_duration,
+            max_patches=self.max_patches,
+        )
+        chunk = chunk_info["waveform"]
         bytes_list = chunk_info["bytes_list"]
         patch_mask = chunk_info["patch_mask"]
-        chunk = chunk_info["waveform"]
 
-        # Retrieve similar audio
-        results = self.retriever.retrieve(chunk, k=self.top_k)
-        if results:
-            retrieved_path = results[0]["path"]
-            retrieved_signal, rsr = librosa.load(retrieved_path, sr=None, mono=False)
-            retrieved_signal = torch.from_numpy(retrieved_signal).float()
-            if retrieved_signal.ndim == 1:
-                retrieved_signal = retrieved_signal.unsqueeze(0)
-            if rsr != Config.ENCODEC_SAMPLE_RATE:
-                retrieved_signal = torchaudio.functional.resample(
-                    retrieved_signal, rsr, Config.ENCODEC_SAMPLE_RATE
-                )
-            if retrieved_signal.shape[0] > 1:
-                retrieved_signal = retrieved_signal.mean(dim=0, keepdim=True)
-            target_len = chunk.shape[-1]
-            if retrieved_signal.shape[-1] < target_len:
-                pad = target_len - retrieved_signal.shape[-1]
-                retrieved_signal = torch.nn.functional.pad(retrieved_signal, (0, pad))
-            else:
-                retrieved_signal = retrieved_signal[:, :target_len]
-        else:
-            # Fall back to the chunk itself if retrieval fails
-            retrieved_signal = chunk
+        results = self.chunk_retrievals[idx]
+        retrieved_signal, _ = _aggregate_retrieved_waveforms(results, chunk)
 
         return {
             "audio_patches": torch.tensor(bytes_list, dtype=torch.long),
@@ -513,10 +598,11 @@ def compress_audio_file(
     chunk_duration: float = Config.CHUNK_DURATION,
     precision: int = Config.PRECISION,
     prefix_length: int = Config.PREFIX_LENGTH,
+    top_k: int = Config.TOP_K_RETRIEVAL,
+    max_patches: int = Config.MAX_PATCHES,
 ):
     """
-    Compress a WAV file using RAGEnCodecBGPT + arithmetic coding.
-    Saves compressed output to output_path.
+    Compress a WAV file by arithmetic-coding its exact PCM byte stream.
 
     Returns:
         compress_ratio: float
@@ -534,43 +620,41 @@ def compress_audio_file(
 
     with wave.open(wav_path, "rb") as wav_in:
         params = wav_in.getparams()
-        chunk_frames = _chunk_frame_budget(params, chunk_duration)
+        chunk_frames = _chunk_frame_budget(
+            params,
+            chunk_duration,
+            max_patches=max_patches,
+        )
         n_chunks = max(1, (params.nframes + chunk_frames - 1) // chunk_frames)
 
+    file_metadata = {
+        "nchannels": params.nchannels,
+        "sampwidth": params.sampwidth,
+        "framerate": params.framerate,
+        "nframes": params.nframes,
+        "comptype": params.comptype,
+        "compname": params.compname,
+    }
     for i in range(n_chunks):
-        chunk_info = load_wav_chunk(wav_path, i, chunk_duration)
+        chunk_info = load_wav_chunk(
+            wav_path,
+            i,
+            chunk_duration,
+            max_patches=max_patches,
+        )
         chunk = chunk_info["waveform"]
         bytes_list = chunk_info["bytes_list"]
         patch_mask = chunk_info["patch_mask"]
+        pcm_num_bytes = chunk_info["pcm_num_bytes"]
 
         audio_patches = torch.tensor(bytes_list, dtype=torch.long).unsqueeze(0).to(device)
         audio_masks = torch.tensor(patch_mask, dtype=torch.long).unsqueeze(0).to(device)
 
-        results = rag_retriever.retrieve(chunk, k=1)
-        if results:
-            ret_signal, rsr = librosa.load(results[0]["path"], sr=None, mono=False)
-            ret_signal = torch.from_numpy(ret_signal).float()
-
-            if ret_signal.ndim == 1:
-                ret_signal = ret_signal.unsqueeze(0)
-
-            if rsr != Config.ENCODEC_SAMPLE_RATE:
-                ret_signal = torchaudio.functional.resample(
-                    ret_signal, rsr, Config.ENCODEC_SAMPLE_RATE
-                )
-
-            if ret_signal.shape[0] > 1:
-                ret_signal = ret_signal.mean(dim=0, keepdim=True)
-
-            target_len = chunk.shape[-1]
-            if ret_signal.shape[-1] < target_len:
-                ret_signal = torch.nn.functional.pad(
-                    ret_signal, (0, target_len - ret_signal.shape[-1])
-                )
-            else:
-                ret_signal = ret_signal[:, :target_len]
-        else:
-            ret_signal = chunk
+        chunk_retrieval_results = rag_retriever.retrieve(chunk, k=top_k)
+        ret_signal, retrieved_paths = _aggregate_retrieved_waveforms(
+            chunk_retrieval_results,
+            chunk,
+        )
 
         retrieved_waveform = ret_signal.unsqueeze(0).to(device)
 
@@ -590,7 +674,10 @@ def compress_audio_file(
             base=2, precision=precision, output_fn=output_bits.append
         )
 
-        target = input_ids[:, prefix_length:].detach().cpu().numpy().reshape(-1)
+        target = input_ids[
+            :,
+            prefix_length : prefix_length + pcm_num_bytes,
+        ].detach().cpu().numpy().reshape(-1)
         probs_np = (
             logits[:, prefix_length - 1 :, :]
             .softmax(dim=-1)
@@ -599,6 +686,7 @@ def compress_audio_file(
             .numpy()
             .squeeze(0)
         )
+        probs_np = probs_np[: len(target)]
 
         for symbol, prob in zip(target, probs_np):
             encoder.encode(
@@ -610,14 +698,14 @@ def compress_audio_file(
         compressed_bytes, num_padded_bits = ac_utils.bits_to_bytes(compressed_bits)
 
         total_metric.accumulate(len(compressed_bytes), len(target))
-        start_patch = audio_patches[:, :PATCH_SIZE].squeeze(0).detach().cpu().tolist()
+        format_patch = audio_patches[:, :PATCH_SIZE].squeeze(0).detach().cpu().tolist()
         all_compressed.append(
             {
                 "data": compressed_bytes,
                 "num_padded_bits": num_padded_bits,
-                "original_length": len(target),
-                "start_patch": start_patch,
-                "retrieved_path": results[0]["path"] if results else None,
+                "pcm_num_bytes": pcm_num_bytes,
+                "format_patch": format_patch,
+                "retrieved_path": "\n".join(retrieved_paths) if retrieved_paths else None,
             }
         )
 
@@ -626,33 +714,31 @@ def compress_audio_file(
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     with open(output_path, "wb") as f:
-        # Binary container format:
-        # - 4 bytes magic: b"RAGA"
-        # - 1 byte version
-        # - 4 bytes chunk count
-        # Then for each chunk:
-        # - 4 bytes compressed payload length
-        # - 1 byte num_padded_bits
-        # - 4 bytes original_length
-        # - 2 bytes start_patch length
-        # - start_patch values as uint16
-        # - 2 bytes retrieved_path byte length
-        # - retrieved_path bytes (utf-8)
-        # - compressed payload bytes
-        f.write(b"RAGA")
-        f.write((1).to_bytes(1, "big"))
+        comptype_bytes = file_metadata["comptype"].encode("utf-8")
+        compname_bytes = file_metadata["compname"].encode("utf-8")
+
+        f.write(b"RAGP")
+        f.write((2).to_bytes(1, "big"))
         f.write(len(all_compressed).to_bytes(4, "big"))
+        f.write(file_metadata["nchannels"].to_bytes(2, "big"))
+        f.write(file_metadata["sampwidth"].to_bytes(2, "big"))
+        f.write(file_metadata["framerate"].to_bytes(4, "big"))
+        f.write(file_metadata["nframes"].to_bytes(4, "big"))
+        f.write(len(comptype_bytes).to_bytes(2, "big"))
+        f.write(comptype_bytes)
+        f.write(len(compname_bytes).to_bytes(2, "big"))
+        f.write(compname_bytes)
 
         for chunk in all_compressed:
             data = chunk["data"]
-            start_patch = chunk["start_patch"]
+            format_patch = chunk["format_patch"]
             retrieved_path = (chunk["retrieved_path"] or "").encode("utf-8")
 
             f.write(len(data).to_bytes(4, "big"))
             f.write(chunk["num_padded_bits"].to_bytes(1, "big"))
-            f.write(chunk["original_length"].to_bytes(4, "big"))
-            f.write(len(start_patch).to_bytes(2, "big"))
-            f.write(struct.pack(f">{len(start_patch)}H", *start_patch))
+            f.write(chunk["pcm_num_bytes"].to_bytes(4, "big"))
+            f.write(len(format_patch).to_bytes(2, "big"))
+            f.write(struct.pack(f">{len(format_patch)}H", *format_patch))
             f.write(len(retrieved_path).to_bytes(2, "big"))
             f.write(retrieved_path)
             f.write(data)
@@ -666,8 +752,12 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="Train RAG-EnCodec-bGPT audio compressor")
-    parser.add_argument("--audio_dir", type=str, required=True,
+    parser.add_argument("--audio_dir", type=str, default=None,
                         help="Directory of WAV training files")
+    parser.add_argument("--audio_manifest", type=str, default=None,
+                        help="Text file listing WAV training files, one per line")
+    parser.add_argument("--retriever_manifest", type=str, default=None,
+                        help="Optional text file listing WAV files to build the retriever index from")
     parser.add_argument("--retriever_path", type=str, default="retriever_cache/encodec",
                         help="Path to save/load FAISS index")
     parser.add_argument("--bgpt_checkpoint", type=str,
@@ -676,6 +766,12 @@ def main():
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--max_wavs", type=int, default=None,
+                        help="Optional cap on the number of WAV files to use")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+                        help="Path to checkpoint dir to resume from, or 'latest' to auto-detect")
+    parser.add_argument("--retrieval_cache", type=str, default="retriever_cache/chunk_retrievals.pkl",
+                        help="Path to cache pre-computed chunk retrievals across runs")
     args = parser.parse_args()
 
     device = Config.DEVICE
@@ -686,14 +782,27 @@ def main():
     for p in encodec.parameters():
         p.requires_grad = False
 
+    train_audio_files = _load_wav_paths(
+        audio_dir=args.audio_dir,
+        audio_manifest=args.audio_manifest,
+    )
+    if args.max_wavs is not None:
+        train_audio_files = train_audio_files[:args.max_wavs]
+        print(f"Using {len(train_audio_files)} WAV files due to --max_wavs={args.max_wavs}")
+
+    retriever_audio_files = (
+        _load_wav_paths(audio_manifest=args.retriever_manifest)
+        if args.retriever_manifest is not None
+        else train_audio_files
+    )
+
     # Build / load RAG index
     retriever = EnCodecRAGRetriever(persist_path=args.retriever_path)
-    audio_files = glob(os.path.join(args.audio_dir, "**/*.wav"), recursive=True)
-    if not audio_files:
-        raise FileNotFoundError(f"No WAV files found in {args.audio_dir}")
-
     if retriever.index.ntotal == 0:
-        retriever.index_audio_files(audio_files)
+        print(f"Building retriever index from {len(retriever_audio_files)} WAV files")
+        retriever.index_audio_files(retriever_audio_files)
+    else:
+        print(f"Using existing retriever index at {args.retriever_path} with {retriever.index.ntotal} entries")
 
     # Build model
     model = RAGEnCodecBGPT(
@@ -708,11 +817,12 @@ def main():
 
     # Dataset
     dataset = AudioDataset(
-        file_paths=audio_files,
+        file_paths=train_audio_files,
         encodec_model=encodec,
         rag_retriever=retriever,
+        retrieval_cache_path=args.retrieval_cache,
     )
-    print(f"Dataset: {len(dataset)} chunks from {len(audio_files)} files")
+    print(f"Dataset: {len(dataset)} chunks from {len(train_audio_files)} files")
 
     # Training
     training_args = TrainingArguments(
@@ -754,7 +864,10 @@ def main():
         data_collator=collate_fn,
     )
 
-    trainer.train()
+    resume = args.resume_from_checkpoint
+    if resume == "latest":
+        resume = True
+    trainer.train(resume_from_checkpoint=resume)
 
     os.makedirs(args.output_dir, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(args.output_dir, "pytorch_model.bin"))

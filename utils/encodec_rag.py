@@ -11,9 +11,9 @@ import librosa
 
 # ==================== Configuration ====================
 class EnCodecRAGConfig:
-    ENCODEC_MODEL = "facebook/encodec_32khz"
-    SAMPLE_RATE = 32000
-    # EnCodec 32kHz encoder outputs 128-channel features
+    ENCODEC_MODEL = "facebook/encodec_24khz"
+    SAMPLE_RATE = 24000
+    # EnCodec 32kHz encoder outputs 128-channel features.
     ENCODER_DIM = 128
     DEFAULT_PERSIST_PATH = "retriever_cache/audio_encodec_storage"
     INDEX_FILENAME = "encodec_faiss_index.bin"
@@ -56,7 +56,7 @@ class EnCodecRAGRetriever:
             print(f"No existing index at '{persist_path}', initializing empty index")
             self.doc_store = {}
             self.next_id = 0
-            self.index = faiss.IndexIDMap(faiss.IndexFlatL2(self.embedding_dim))
+            self.index = faiss.IndexIDMap(faiss.IndexFlatIP(self.embedding_dim))
 
         print("=" * 60)
 
@@ -72,9 +72,10 @@ class EnCodecRAGRetriever:
         waveform = waveform.to(self.device)
         # EncodecModel.encoder returns continuous features [B, D, T]
         enc_out = self.encodec.encoder(waveform)
-        # Mean-pool over time → [B, D]
         embedding = enc_out.mean(dim=-1)
-        return embedding.cpu().numpy().astype("float32")
+        embedding = embedding.cpu().numpy().astype("float32")
+        faiss.normalize_L2(embedding)
+        return embedding
 
     def index_audio_files(self, file_paths: List[str]):
         """Build FAISS index from a list of audio file paths."""
