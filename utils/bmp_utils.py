@@ -217,9 +217,8 @@ def resize_bmp(input_path: str, output_path: str, target_size: tuple):
 
 
 if __name__ == "__main__":
-    SOURCE_IMAGE_FOLDER = "datasets/clic_2024/raw"
+    SOURCE_IMAGE_FOLDER = "datasets/clic_2024/png"
     BMP_OUTPUT_FOLDER = "datasets/clic_2024/bmp"
-    PATCH_SIZE = 32
     
     # Convert all images to BMP
     print("=" * 60)

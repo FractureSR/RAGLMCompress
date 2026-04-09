@@ -16,11 +16,10 @@ logger.setLevel(logging.INFO)
 class LLMCompressionConfig:
     """Configuration for LLM-based compression"""
     # Model paths
-    MODEL_NAME = "pretrained/Qwen3-0.6B"
+    MODEL_NAME = "pretrained/SmolLM2-135M"
     
     # Dataset paths
     DATASET_PATH = "datasets/cosmopedia-100k"
-    TEST_SAMPLE_PATH = "datasets/test_workflow/test_sample.txt"
     
     # Output paths
     COMPRESSED_OUTPUT = "compressed.bin"
@@ -30,8 +29,8 @@ class LLMCompressionConfig:
     PREFIX_LENGTH = 1
     
     # Testing parameters
-    NUM_DOCUMENTS_TO_COMPRESS = 2
-    NUM_DOCUMENTS_FOR_RATIO_TEST = 1
+    NUM_DOCUMENTS_TO_COMPRESS = 1
+    NUM_DOCUMENTS_FOR_RATIO_TEST = 10
     NUM_DOCUMENTS_FOR_THEORETICAL_TEST = 10
     
     # Device
@@ -104,14 +103,12 @@ def compress(compress_input, logits, metric, precision=None, prefix_length=None)
         prefix_length = LLMCompressionConfig.PREFIX_LENGTH
     
     output = []
-    # Initialize an Encoder Object
     encoder = arithmetic_coder.Encoder(
         base=2,
         precision=precision,
         output_fn=output.append,
     )
     
-    # The first symbol should be saved for generation in decoding
     start_symbol = compress_input[:, :1]
 
     target_sequence_to_encode = compress_input[:, prefix_length:]
@@ -126,16 +123,13 @@ def compress(compress_input, logits, metric, precision=None, prefix_length=None)
     sequence_array = target_sequence_to_encode.detach().cpu().numpy().reshape(-1)
     pd = pd.squeeze()
 
-    # Compress the sequence
     for symbol, prob, pd_prob in zip(sequence_array, probs, pd):
         encoder.encode(
             ac_utils.normalize_pdf_for_arithmetic_coding(prob, np.float32), symbol
         )
     encoder.terminate()
 
-    # To visualize and compute metrics, map to str
     compressed_bits = "".join(map(str, output))
-    # You can only save in bytes, so need to pad some bits
     compressed_bytes, num_padded_bits = ac_utils.bits_to_bytes(compressed_bits)
     
     metric.accumulate(len(compressed_bytes), len(sequence_array))
@@ -180,19 +174,16 @@ def decode(
     if precision is None:
         precision = LLMCompressionConfig.PRECISION
     
-    # Convert bytes back to bit stream
     data_iter = iter(
         ac_utils.bytes_to_bits(compressed_bytes, num_padded_bits=num_padded_bits)
     )
 
-    # Utils function to read bits
-    def _input_fn(bit_sequence: Iterator[str] = data_iter) -> int | None:
+    def _input_fn(bit_sequence: Iterator[str] = data_iter) -> Optional[int]:
         try:
             return int(next(bit_sequence))
         except StopIteration:
             return None
 
-    # Initialize a Decoder Object
     decoder = arithmetic_coder.Decoder(
         base=2,
         precision=precision,
@@ -204,7 +195,6 @@ def decode(
     target_diff_list = []
     target_in_top5_list = []
 
-    # Pad the input to the original length
     sequence_array_de_input = torch.tensor(
         sequence_array_de_input, dtype=torch.long, device=device
     )
@@ -212,19 +202,17 @@ def decode(
         sequence_array_de_input, (0, original_seq_len - 1), value=0
     )
 
-    # Loop for decompressing
     for i in range(original_seq_len):
         with torch.no_grad():
             logits = model(sequence_array_de_input, use_cache=False).logits.to(
                 torch.float32
             )
-        # Get generation probabilities, decode the next token
+
         prob_de = logits.softmax(dim=-1).detach().cpu().numpy().squeeze(0)
 
         de_token = decoder.decode(
             ac_utils.normalize_pdf_for_arithmetic_coding(prob_de[i], np.float32)
         )
-        # Append to the generated sequence
         sequence_array_de = np.append(sequence_array_de, de_token)
 
         current_len = len(sequence_array_de)
@@ -236,6 +224,7 @@ def decode(
             )
         else:
             padded = sequence_array_de
+
         sequence_array_de_input = torch.tensor(
             padded, dtype=torch.long, device=device
         ).unsqueeze(0)
@@ -244,15 +233,14 @@ def decode(
             top_indices_de = prob_de[i].argsort()[-5:][::-1]
             top_indices = probs[i].argsort()[-5:][::-1]
 
-            # Target diff
             target_diff = (
                 probs[i, original_sequence[i]] - prob_de[i, original_sequence[i]]
             )
             target_diff_list.append(target_diff)
 
-            # Target in top 5
             target_in_top5 = original_sequence[i] in top_indices
             target_in_top5_list.append(target_in_top5)
+
             print(
                 f"idx: {i}, original token: {original_sequence[i]}, decoder token: {de_token}"
             )
@@ -263,6 +251,7 @@ def decode(
                 f"original: {top_indices}, target_in_top5: {target_in_top5} decode: {top_indices_de}, "
             )
             print(f"target diff: {target_diff}")
+
             if original_sequence[i] != de_token:
                 import pdb
                 pdb.set_trace()
@@ -280,11 +269,6 @@ def write_padded_bytes(
     - first byte: number of padded bits
     - second and third bytes: original length (max 65535)
     - subsequent bytes: actual compressed data
-
-    :param filename: output file name
-    :param data: bytes data to write
-    :param num_padded_bits: number of padded bits (0-7)
-    :param original_length: original length in tokens (0-65535)
     """
     if not 0 <= num_padded_bits <= 7:
         raise ValueError("num_padded_bits must be between 0 and 7.")
@@ -305,13 +289,8 @@ def write_padded_bytes(
 def read_padded_bytes(filename: str) -> Tuple[bytes, int, int]:
     """
     Read compressed data and metadata from file
-
-    :param filename: input file name
-    :return: tuple of (data, num_padded_bits, original_length)
-    :raises EOFError: if file is empty or improperly formatted
     """
     with open(filename, "rb") as f:
-        # The first byte indicates the number of padded bits
         padding_byte = f.read(1)
         if not padding_byte:
             raise EOFError(
@@ -335,10 +314,6 @@ def read_padded_bytes(filename: str) -> Tuple[bytes, int, int]:
 def load_model_and_tokenizer(model_name=None, dtype=None, device_map=None):
     """
     Load LLM model and tokenizer
-    :param model_name: model name or path (default from config)
-    :param dtype: model dtype (default from config)
-    :param device_map: device map for model loading
-    :return: tuple of (model, tokenizer)
     """
     if model_name is None:
         model_name = LLMCompressionConfig.MODEL_NAME
@@ -356,42 +331,14 @@ def load_model_and_tokenizer(model_name=None, dtype=None, device_map=None):
     return llm, tokenizer
 
 
-def load_test_sample(test_sample_path: str = None) -> Optional[str]:
-    """
-    Try to load test sample from file
-    
-    :param test_sample_path: path to test sample file (default from config)
-    :return: test sample text if found, None otherwise
-    """
-    if test_sample_path is None:
-        test_sample_path = LLMCompressionConfig.TEST_SAMPLE_PATH
-    
-    try:
-        with open(test_sample_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-        test_sample = '\n'.join(lines)
-        print(f"✓ Loaded test sample from {test_sample_path}")
-        print(f"  Test sample length: {len(test_sample)} characters")
-        return test_sample
-    except FileNotFoundError:
-        print(f"✗ Test sample file not found at {test_sample_path}")
-        return None
-    except Exception as e:
-        print(f"✗ Error loading test sample: {e}")
-        return None
-
-
 def load_compression_dataset(
     dataset_path: str = None,
     num_documents: int = None,
-    test_sample_path: str = None
 ) -> Tuple[List[str], int]:
     """
     Load documents for compression testing
-    
     :param dataset_path: path to dataset (default from config)
     :param num_documents: number of documents to load (default from config)
-    :param test_sample_path: path to test sample file (default from config)
     :return: tuple of (list of document texts, total_length)
     """
     if dataset_path is None:
@@ -400,28 +347,17 @@ def load_compression_dataset(
         num_documents = LLMCompressionConfig.NUM_DOCUMENTS_TO_COMPRESS
     
     print(f"\nLoading documents for compression testing...")
-    
-    # Try to load test sample first
-    test_sample = load_test_sample(test_sample_path)
-    
-    if test_sample is not None:
-        # Use test sample
-        print(f"Using test sample as the document to compress")
-        documents = [test_sample]
-        total_length = len(test_sample)
-        print(f"Total documents: 1 (from test sample)")
-    else:
-        # Load from dataset
-        print(f"Loading documents from dataset: {dataset_path}")
-        to_be_compressed = load_dataset(dataset_path, split="train", streaming=True)
-        to_be_compressed = to_be_compressed.remove_columns(
-            ["prompt", "text_token_length", "seed_data", "format", "audience"]
-        )
-        documents_data = list(iter(to_be_compressed.take(num_documents)))
-        documents = [doc["text"] for doc in documents_data]
-        total_length = sum(len(doc) for doc in documents)
-        print(f"✓ Loaded {len(documents)} documents from dataset")
-    
+    print(f"Loading documents from dataset: {dataset_path}")
+
+    to_be_compressed = load_dataset(dataset_path, split="train", streaming=True)
+    to_be_compressed = to_be_compressed.remove_columns(
+        ["prompt", "text_token_length", "seed_data", "format", "audience"]
+    )
+    documents_data = list(iter(to_be_compressed.take(num_documents)))
+    documents = [doc["text"] for doc in documents_data]
+    total_length = sum(len(doc) for doc in documents)
+
+    print(f"✓ Loaded {len(documents)} documents from dataset")
     print(f"Total length: {total_length} characters\n")
     return documents, total_length
 
@@ -429,31 +365,27 @@ def load_compression_dataset(
 # ==================== Test Functions ====================
 def test_workflow():
     """Test complete compression and decompression workflow"""
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("=== Testing Complete Workflow ===")
-    print("="*60)
+    print("=" * 60)
     
-    # Model and tokenizer loading
     device = torch.device(LLMCompressionConfig.DEVICE)
     llm, tokenizer = load_model_and_tokenizer()
     llm = llm.to(device)
 
-    # Prepare data to be compressed
     documents, total_length = load_compression_dataset()
 
-    # Workflow
     compression_start_time = time.time()
 
     for idx, doc in enumerate(documents, 1):
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Processing document {idx}/{len(documents)}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         
         tokenized = tokenizer(doc, return_tensors="pt").to(device)
 
         metric = Metric()
         with torch.inference_mode():
-            # We don't need the last token's logits
             logits = (
                 llm(tokenized["input_ids"], use_cache=False)
                 .logits[:, :-1]
@@ -472,10 +404,10 @@ def test_workflow():
         print(f"Original length: {original_length} tokens")
         
         write_padded_bytes(
-            LLMCompressionConfig.COMPRESSED_OUTPUT, 
-            compressed_bytes, 
-            num_padded_bits, 
-            original_length
+            LLMCompressionConfig.COMPRESSED_OUTPUT,
+            compressed_bytes,
+            num_padded_bits,
+            original_length,
         )
         
         compressed_bytes, num_padded_bits, original_length = read_padded_bytes(
@@ -521,14 +453,12 @@ def test_workflow():
 
 def test_compression_ratio():
     """Test compression ratio on dataset"""
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("=== Testing Compression Ratio ===")
-    print("="*60)
+    print("=" * 60)
     
-    # Model and tokenizer loading
     llm, tokenizer = load_model_and_tokenizer(device_map="auto")
 
-    # Prepare data to be compressed
     documents, total_length = load_compression_dataset(
         num_documents=LLMCompressionConfig.NUM_DOCUMENTS_FOR_RATIO_TEST
     )
@@ -540,7 +470,6 @@ def test_compression_ratio():
         input_ids = tokenized["input_ids"].to(llm.device)
         
         with torch.inference_mode():
-            # We don't need the last token's logits
             logits = (
                 llm(input_ids, use_cache=False)
                 .logits[:, :-1]
@@ -551,38 +480,40 @@ def test_compression_ratio():
             compress(input_ids, logits, metric)
         )
     
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("=== Final Results ===")
-    print("="*60)
+    print("=" * 60)
     compress_rate, compress_ratio = metric.compute_ratio(set_total_length=total_length)
     print(f"Total original length: {total_length} characters")
     print(f"Total compressed length: {metric.compressed_length} bytes")
     print(f"Compression ratio: {compress_ratio:.6f}")
     print(f"Compression rate: {compress_rate:.6f}x")
-    print("="*60)
+    print("=" * 60)
 
 
 def test_theoretical_compression_ratio():
     """Test theoretical compression ratio using entropy"""
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("=== Testing Theoretical Compression Ratio ===")
-    print("="*60)
+    print("=" * 60)
     
-    # Model and tokenizer loading
     llm, tokenizer = load_model_and_tokenizer()
     device = torch.device(LLMCompressionConfig.DEVICE)
     llm = llm.to(device)
 
-    # Prepare data to be compressed
     documents, total_length = load_compression_dataset(
         num_documents=LLMCompressionConfig.NUM_DOCUMENTS_FOR_THEORETICAL_TEST
     )
 
-    for idx, doc in enumerate(tqdm.tqdm(documents, desc="Computing theoretical ratios"), 1):
+    accu_original_bits = 0
+    accu_compressed_bits = 0
+
+    for idx, doc in enumerate(
+        tqdm.tqdm(documents, desc="Computing theoretical ratios"), 1
+    ):
         tokenized = tokenizer(doc, return_tensors="pt").to(device)
         
         with torch.inference_mode():
-            # We don't need the last token's logits
             logits = (
                 llm(tokenized["input_ids"], use_cache=False)
                 .logits[:, :-1]
@@ -597,16 +528,19 @@ def test_theoretical_compression_ratio():
         total_log_prob_nats = pd.sum()
         bits = -total_log_prob_nats / math.log(2)
 
-        theoretical_ratio = len(doc) * 8 / bits.item()
-        print(f"\nDocument {idx}:")
-        print(f"  Length: {len(doc)} characters")
-        print(f"  Theoretical bits needed: {bits.item():.2f}")
-        print(f"  Theoretical compression ratio: {theoretical_ratio:.6f}")
+        accu_original_bits += len(doc) * 8
+        accu_compressed_bits += bits.item()
+        
+    theoretical_ratio = accu_original_bits / accu_compressed_bits
+    print(f"\nDocument {idx}:")
+    print(f"  Length: {len(doc)} characters")
+    print(f"  Theoretical bits needed: {bits.item():.2f}")
+    print(f"  Theoretical compression ratio: {theoretical_ratio:.6f}")
 
 
 # ==================== Main ====================
 if __name__ == "__main__":
     # Uncomment the test you want to run
-    test_workflow()
+    # test_workflow()
     # test_compression_ratio()
-    # test_theoretical_compression_ratio()
+    test_theoretical_compression_ratio()

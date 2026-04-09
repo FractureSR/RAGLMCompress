@@ -1,3 +1,4 @@
 /pretrained
-/compressed.bin
+compressed.bin
 /datasets
+__pycache__
