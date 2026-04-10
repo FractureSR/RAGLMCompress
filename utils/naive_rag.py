@@ -5,6 +5,7 @@ import pickle
 import time
 import gc
 from typing import List, Dict, Any, Optional
+
 from datasets import load_dataset
 from sentence_transformers import SentenceTransformer
 
@@ -15,20 +16,20 @@ class RAGRetrieverConfig:
     # Model configuration
     DEFAULT_MODEL_NAME = "pretrained/Qwen3-Embedding-0.6B"
     NORMALIZE_EMBEDDINGS = True
-    
+
     # Storage configuration
-    DEFAULT_PERSIST_PATH = "retriever_cache/wikipedia-qwen3_embedding_0.6B-storage"
+    DEFAULT_PERSIST_PATH = "retriever_cache/cosmopedia-100k-qwen3_embedding_0.6B-storage"
     INDEX_FILENAME = "faiss_index.bin"
     DOC_STORE_FILENAME = "doc_store.pkl"
-    
+
     # Chunking configuration
     CHUNK_SIZE = 256
     CHUNK_OVERLAP = 32
-    
+
     # Dataset configuration
-    DEFAULT_DATASET_PATH = "datasets/wiki20231101en"
+    DEFAULT_DATASET_PATH = "datasets/cosmopedia-100k"
     DEFAULT_NUM_DOCUMENTS = 1000
-    
+
     # Retrieval configuration
     DEFAULT_TOP_K = 5
 
@@ -36,7 +37,7 @@ class RAGRetrieverConfig:
 # ==================== RAG Retriever Class ====================
 class SimpleRagRetriever:
     """Simple RAG retriever using FAISS and SentenceTransformer"""
-    
+
     def __init__(
         self,
         model_name: str = None,
@@ -45,7 +46,7 @@ class SimpleRagRetriever:
     ):
         """
         Initialize RAG retriever
-        
+
         :param model_name: embedding model name or path (default from config)
         :param normalize_embeddings: whether to normalize embeddings (default from config)
         :param persist_path: path to persist/load index (default from config)
@@ -56,17 +57,17 @@ class SimpleRagRetriever:
             normalize_embeddings = RAGRetrieverConfig.NORMALIZE_EMBEDDINGS
         if persist_path is None:
             persist_path = RAGRetrieverConfig.DEFAULT_PERSIST_PATH
-        
-        print("="*60)
+
+        print("=" * 60)
         print("Initializing RAG Retriever")
-        print("="*60)
+        print("=" * 60)
         print(f"Loading embedding model: {model_name}")
-        
+
         self.embedding_model = SentenceTransformer(model_name)
         self.normalize_embeddings = normalize_embeddings
         self.embedding_dim = self.embedding_model.get_sentence_embedding_dimension()
-        
-        print(f"✓ Embedding model loaded")
+
+        print("✓ Embedding model loaded")
         print(f"  Embedding dimension: {self.embedding_dim}")
         print(f"  Normalize embeddings: {self.normalize_embeddings}")
 
@@ -78,7 +79,7 @@ class SimpleRagRetriever:
         if os.path.exists(self.index_file) and os.path.exists(self.doc_store_file):
             print(f"\n✓ Found existing index at '{self.persist_path}'")
             self._load_index()
-            print(f"✓ Index loaded successfully")
+            print("✓ Index loaded successfully")
             print(f"  Total indexed documents: {self.index.ntotal}")
         else:
             print(f"\n✗ No existing index found at '{self.persist_path}'")
@@ -86,12 +87,12 @@ class SimpleRagRetriever:
             self.doc_store = {}
             self.next_id = 0
             self.index = None
-        
-        print("="*60)
-    
+
+        print("=" * 60)
+
     def _save_index(self):
         """Save the FAISS index and document store to disk"""
-        if not self.persist_path:
+        if not self.persist_path or self.index is None:
             return
 
         print(f"\nSaving index to '{self.persist_path}'...")
@@ -102,25 +103,47 @@ class SimpleRagRetriever:
 
         # Save doc_store and next_id using pickle
         with open(self.doc_store_file, "wb") as f:
-            pickle.dump({
-                "doc_store": self.doc_store,
-                "next_id": self.next_id
-            }, f)
-        
-        print(f"✓ Index saved successfully")
+            pickle.dump(
+                {
+                    "doc_store": self.doc_store,
+                    "next_id": self.next_id
+                },
+                f
+            )
+
+        print("✓ Index saved successfully")
         print(f"  Index file: {self.index_file}")
         print(f"  Document store file: {self.doc_store_file}")
 
     def _load_index(self):
         """Load the FAISS index and document store from disk"""
-        # Load FAISS index
         self.index = faiss.read_index(self.index_file)
 
-        # Load doc_store and next_id from pickle file
         with open(self.doc_store_file, "rb") as f:
             data = pickle.load(f)
             self.doc_store = data["doc_store"]
             self.next_id = data["next_id"]
+
+    def clear_index(self, delete_persisted_files: bool = False):
+        """
+        Clear in-memory index and optionally delete persisted files.
+
+        :param delete_persisted_files: whether to delete saved FAISS/pickle files
+        """
+        print("\nClearing current retriever index...")
+        self.index = None
+        self.doc_store = {}
+        self.next_id = 0
+        gc.collect()
+        print("✓ In-memory index cleared")
+
+        if delete_persisted_files:
+            if os.path.exists(self.index_file):
+                os.remove(self.index_file)
+                print(f"✓ Deleted index file: {self.index_file}")
+            if os.path.exists(self.doc_store_file):
+                os.remove(self.doc_store_file)
+                print(f"✓ Deleted document store file: {self.doc_store_file}")
 
     def _chunk_text(
         self,
@@ -130,7 +153,7 @@ class SimpleRagRetriever:
     ) -> List[str]:
         """
         Split text into overlapping chunks
-        
+
         :param text: text to chunk
         :param chunk_size: size of each chunk in words (default from config)
         :param chunk_overlap: overlap between chunks in words (default from config)
@@ -140,77 +163,157 @@ class SimpleRagRetriever:
             chunk_size = RAGRetrieverConfig.CHUNK_SIZE
         if chunk_overlap is None:
             chunk_overlap = RAGRetrieverConfig.CHUNK_OVERLAP
-        
+
         words = text.split()
         if not words:
             return []
-        
+
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be > 0")
+        if chunk_overlap < 0:
+            raise ValueError("chunk_overlap must be >= 0")
+        if chunk_overlap >= chunk_size:
+            raise ValueError("chunk_overlap must be smaller than chunk_size")
+
         chunks = []
-        for i in range(0, len(words), chunk_size - chunk_overlap):
+        step = chunk_size - chunk_overlap
+        for i in range(0, len(words), step):
             chunk = words[i:i + chunk_size]
-            chunks.append(" ".join(chunk))
-        
+            if chunk:
+                chunks.append(" ".join(chunk))
+
         return chunks
 
-    def index_documents(self, documents: List[Dict[str, str]]):
+    def _extract_document_text(self, doc: Any) -> str:
         """
-        Index a list of documents
-        If the index already exists, new documents will be added to it
-        
-        :param documents: list of documents, each with 'title' and 'text' fields
+        Convert different document formats into plain text for indexing.
+
+        Supported formats:
+        - {"title": ..., "text": ...}
+        - {"text": ...}
+        - {"content": ...}
+        - {"body": ...}
+        - {"document": ...}
+        - raw string
+        """
+        if isinstance(doc, str):
+            return doc.strip()
+
+        if not isinstance(doc, dict):
+            raise TypeError(f"Unsupported document type: {type(doc)}")
+
+        title = doc.get("title", None)
+
+        text = None
+        for key in ["text", "content", "body", "document"]:
+            if key in doc and doc[key] is not None:
+                text = doc[key]
+                break
+
+        if text is None:
+            raise KeyError(
+                f"Cannot find text field in document. Available keys: {list(doc.keys())}"
+            )
+
+        text = str(text).strip()
+        if not text:
+            return ""
+
+        if title is not None and str(title).strip():
+            return f"Title: {str(title).strip()}\n{text}"
+
+        return text
+
+    def index_documents(self, documents: List[Any]):
+        """
+        Index a list of documents.
+        If the index already exists, new documents will be added to it.
+
+        Supported document formats:
+        - {"title": ..., "text": ...}
+        - {"text": ...}
+        - {"content": ...}
+        - {"body": ...}
+        - {"document": ...}
+        - raw string
         """
         if not documents:
             print("✗ No documents to index")
             return
 
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("Starting Document Indexing")
-        print("="*60)
+        print("=" * 60)
         print(f"Number of documents to index: {len(documents)}")
-        
+
         all_chunks = []
         start_id = self.next_id
+        valid_doc_count = 0
+        skipped_doc_count = 0
 
         # Chunk all documents
         for idx, doc in enumerate(documents, 1):
-            doc_text = f"Title: {doc['title']}\n{doc['text']}"
+            try:
+                doc_text = self._extract_document_text(doc)
+            except Exception as e:
+                print(f"  Warning: skipped document {idx} due to error: {e}")
+                skipped_doc_count += 1
+                continue
+
+            if not doc_text.strip():
+                print(f"  Warning: skipped empty document {idx}")
+                skipped_doc_count += 1
+                continue
+
             chunks = self._chunk_text(doc_text)
-            
+            if not chunks:
+                print(f"  Warning: skipped document {idx} because no chunks were produced")
+                skipped_doc_count += 1
+                continue
+
+            valid_doc_count += 1
+
             for chunk in chunks:
                 current_id = self.next_id
                 self.doc_store[current_id] = chunk
                 all_chunks.append(chunk)
                 self.next_id += 1
-            
+
             if idx % 100 == 0:
                 print(f"  Processed {idx}/{len(documents)} documents...")
-        
+
         if not all_chunks:
             print("✗ Warning: No chunks generated from documents")
             return
-        
-        print(f"✓ Chunking complete")
+
+        print("✓ Chunking complete")
+        print(f"  Valid documents: {valid_doc_count}")
+        print(f"  Skipped documents: {skipped_doc_count}")
         print(f"  Total chunks: {len(all_chunks)}")
-        print(f"  Average chunks per document: {len(all_chunks)/len(documents):.1f}")
+        print(
+            f"  Average chunks per valid document: "
+            f"{len(all_chunks) / max(valid_doc_count, 1):.1f}"
+        )
 
         # Generate embeddings
         print(f"\nGenerating embeddings for {len(all_chunks)} chunks...")
         start_time = time.time()
         embeddings = self.embedding_model.encode(
-            all_chunks, 
-            show_progress_bar=True, 
+            all_chunks,
+            show_progress_bar=True,
             convert_to_numpy=True,
             normalize_embeddings=self.normalize_embeddings
         )
         end_time = time.time()
-        print(f"✓ Embedding generation complete")
-        print(f"  Time taken: {end_time - start_time:.2f} seconds")
-        print(f"  Speed: {len(all_chunks)/(end_time - start_time):.1f} chunks/second")
+        elapsed = max(end_time - start_time, 1e-8)
+
+        print("✓ Embedding generation complete")
+        print(f"  Time taken: {elapsed:.2f} seconds")
+        print(f"  Speed: {len(all_chunks) / elapsed:.1f} chunks/second")
 
         # Build or update FAISS index
-        print(f"\nBuilding/updating FAISS index...")
+        print("\nBuilding/updating FAISS index...")
         if self.index is None:
-            # Create new FAISS index
             if self.normalize_embeddings:
                 # Use Inner Product for normalized embeddings (cosine similarity)
                 base_index = faiss.IndexFlatIP(self.embedding_dim)
@@ -219,17 +322,18 @@ class SimpleRagRetriever:
                 # Use L2 distance for non-normalized embeddings
                 base_index = faiss.IndexFlatL2(self.embedding_dim)
                 print("  Using L2 distance index")
-            
+
             # Wrap with IndexIDMap to allow custom integer IDs
             self.index = faiss.IndexIDMap(base_index)
 
         # FAISS requires IDs to be int64
         ids_to_add = np.arange(start_id, self.next_id, dtype=np.int64)
-        self.index.add_with_ids(embeddings.astype('float32'), ids_to_add)
+        self.index.add_with_ids(embeddings.astype("float32"), ids_to_add)
 
-        print(f"✓ Indexing complete")
+        print("✓ Indexing complete")
+        print(f"  Newly indexed chunks: {len(ids_to_add)}")
         print(f"  Total indexed chunks: {self.index.ntotal}")
-        print("="*60)
+        print("=" * 60)
 
         # Save the updated index to disk
         self._save_index()
@@ -237,14 +341,14 @@ class SimpleRagRetriever:
     def retrieve(self, query: str, k: int = None) -> List[Dict[str, Any]]:
         """
         Retrieve top-k most relevant documents for a query
-        
+
         :param query: search query
         :param k: number of results to return (default from config)
         :return: list of retrieval results with id, text, and score
         """
         if k is None:
             k = RAGRetrieverConfig.DEFAULT_TOP_K
-        
+
         if self.index is None or self.index.ntotal == 0:
             raise RuntimeError(
                 "Index is empty. Please call index_documents() with some data first."
@@ -253,17 +357,17 @@ class SimpleRagRetriever:
         print(f"\nSearching for: '{query[:100]}{'...' if len(query) > 100 else ''}'")
 
         start_time = time.time()
-        
+
         # Encode query
         query_embedding = self.embedding_model.encode(
-            [query], 
+            [query],
             convert_to_numpy=True,
             normalize_embeddings=self.normalize_embeddings
         )
-        
+
         # Search in FAISS index
-        distances, indices = self.index.search(query_embedding.astype('float32'), k)
-        
+        distances, indices = self.index.search(query_embedding.astype("float32"), k)
+
         end_time = time.time()
         print(f"✓ Search completed in {end_time - start_time:.4f} seconds")
 
@@ -271,25 +375,27 @@ class SimpleRagRetriever:
         results = []
         retrieved_ids = indices[0]
         retrieved_scores = distances[0]
-        
+
         for i in range(len(retrieved_ids)):
             doc_id = retrieved_ids[i]
             if doc_id != -1:  # -1 indicates no result found
                 score = retrieved_scores[i]
-                text = self.get_text_by_id(doc_id)
-                results.append({
-                    "id": int(doc_id),
-                    "text": text,
-                    "score": float(score)
-                })
-        
+                text = self.get_text_by_id(int(doc_id))
+                results.append(
+                    {
+                        "id": int(doc_id),
+                        "text": text,
+                        "score": float(score)
+                    }
+                )
+
         print(f"✓ Retrieved {len(results)} results")
         return results
 
     def get_text_by_id(self, doc_id: int) -> Optional[str]:
         """
         Get document text by ID
-        
+
         :param doc_id: document ID
         :return: document text or None if not found
         """
@@ -305,7 +411,7 @@ def load_and_index_documents(
 ):
     """
     Load documents from dataset and index them
-    
+
     :param retriever: RAG retriever instance
     :param dataset_path: path to dataset (default from config)
     :param num_documents: number of documents to index (default from config)
@@ -315,25 +421,32 @@ def load_and_index_documents(
         dataset_path = RAGRetrieverConfig.DEFAULT_DATASET_PATH
     if num_documents is None:
         num_documents = RAGRetrieverConfig.DEFAULT_NUM_DOCUMENTS
-    
-    # Check if we need to index
-    if not force_reindex and retriever.index is not None and retriever.index.ntotal > 0:
+
+    # If force_reindex is enabled, clear both memory and persisted files first
+    if force_reindex:
+        print("\n⚠ force_reindex=True, existing index will be deleted and rebuilt")
+        retriever.clear_index(delete_persisted_files=True)
+
+    # Check if we still need to index
+    if retriever.index is not None and retriever.index.ntotal > 0:
         print("\n✓ Index already exists and is not empty")
         print("  Skipping data download and indexing")
         return
 
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("Loading Dataset for Indexing")
-    print("="*60)
+    print("=" * 60)
     print(f"Dataset: {dataset_path}")
     print(f"Number of documents to load: {num_documents}")
-    
-    dataset = load_dataset(dataset_path, split='train', streaming=True)
+
+    dataset = load_dataset(dataset_path, split="train", streaming=True)
     documents_to_process = list(iter(dataset.take(num_documents)))
-    
+
     print(f"✓ Loaded {len(documents_to_process)} documents")
-    print("="*60)
-    
+    if len(documents_to_process) > 0 and isinstance(documents_to_process[0], dict):
+        print(f"  Sample keys: {list(documents_to_process[0].keys())}")
+    print("=" * 60)
+
     # Index the documents
     retriever.index_documents(documents_to_process)
 
@@ -351,7 +464,7 @@ def display_retrieval_results(
 ):
     """
     Display retrieval results in a formatted way
-    
+
     :param results: list of retrieval results
     :param normalize_embeddings: whether embeddings are normalized
     :param max_text_length: maximum length of text to display
@@ -359,36 +472,34 @@ def display_retrieval_results(
     if not results:
         print("No results found")
         return
-    
-    print(f"\n{'='*60}")
+
+    print(f"\n{'=' * 60}")
     print(f"Top {len(results)} Retrieval Results")
-    print(f"{'='*60}")
-    
+    print(f"{'=' * 60}")
+
     for idx, result in enumerate(results, 1):
         print(f"\nResult {idx}:")
         print(f"  ID: {result['id']}")
-        
-        # Score interpretation
-        score_direction = 'Higher is better' if normalize_embeddings else 'Lower is better'
+
+        score_direction = "Higher is better" if normalize_embeddings else "Lower is better"
         print(f"  Score: {result['score']:.4f} ({score_direction})")
-        
-        # Text preview
-        text = result['text']
+
+        text = result["text"] or ""
         if len(text) > max_text_length:
             text_display = text[:max_text_length] + "..."
         else:
             text_display = text
         print(f"  Text: {text_display}")
-    
-    print(f"\n{'='*60}")
+
+    print(f"\n{'=' * 60}")
 
 
 # ==================== Main ====================
-if __name__ == '__main__':
-    print("\n" + "="*60)
+if __name__ == "__main__":
+    print("\n" + "=" * 60)
     print("RAG Retriever Demo")
-    print("="*60)
-    
+    print("=" * 60)
+
     # 1. Initialize retriever
     storage_path = RAGRetrieverConfig.DEFAULT_PERSIST_PATH
     retriever = SimpleRagRetriever(persist_path=storage_path)
@@ -397,10 +508,10 @@ if __name__ == '__main__':
     load_and_index_documents(retriever)
 
     # 3. The retriever is ready - execute queries
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("Executing Sample Queries")
-    print("="*60)
-    
+    print("=" * 60)
+
     # Query 1
     query1 = "What is the theory of relativity?"
     top_k_results1 = retriever.retrieve(query1, k=3)
@@ -416,7 +527,7 @@ if __name__ == '__main__':
         top_k_results2,
         normalize_embeddings=retriever.normalize_embeddings
     )
-    
-    print("\n" + "="*60)
+
+    print("\n" + "=" * 60)
     print("Demo Complete")
-    print("="*60)
+    print("=" * 60)

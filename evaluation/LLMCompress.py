@@ -46,21 +46,29 @@ class Metric:
     def __init__(self):
         self.total_length = 0
         self.compressed_length = 0
+        self.extra_length = 0
 
     def compute_ratio(self, extra_bytes=0, set_total_length=0):
         """
-        Compute compression ratio and rate
+        Compute compression ratio and rate.
+
+        This method accumulates extra_bytes across calls.
+
         :param extra_bytes: additional bytes to add to compressed length
         :param set_total_length: override total length if non-zero
         :return: (compression_ratio, compression_rate)
         """
-        self.compressed_length = self.compressed_length + extra_bytes
+        self.extra_length += extra_bytes
+
         if set_total_length != 0:
             self.total_length = set_total_length
-        if self.total_length != 0 and self.compressed_length != 0:
+
+        final_compressed_length = self.compressed_length + self.extra_length
+
+        if self.total_length != 0 and final_compressed_length != 0:
             return (
-                self.total_length / self.compressed_length,
-                self.compressed_length / self.total_length,
+                self.total_length / final_compressed_length,
+                final_compressed_length / self.total_length,
             )
         else:
             return 0, 0

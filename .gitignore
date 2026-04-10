@@ -2,3 +2,5 @@
 compressed.bin
 /datasets
 __pycache__
+retriever_cache
+temp_img
