@@ -8,30 +8,32 @@ from typing import List, Dict, Any, Optional
 
 from datasets import load_dataset
 from sentence_transformers import SentenceTransformer
+from utils.text_utils import chunk_words, extract_document_text
 
 
 # ==================== Configuration ====================
 class RAGRetrieverConfig:
     """Configuration for RAG retriever"""
     # Model configuration
-    DEFAULT_MODEL_NAME = "pretrained/Qwen3-Embedding-0.6B"
+    MODEL_NAME = "Qwen3-Embedding-0.6B"
+    MODEL_PATH = "pretrained/" + MODEL_NAME
     NORMALIZE_EMBEDDINGS = True
 
     # Storage configuration
-    DEFAULT_PERSIST_PATH = "retriever_cache/cosmopedia-100k-qwen3_embedding_0.6B-storage"
+    PERSIST_PATH = "retriever_cache/" + MODEL_NAME + "-storage"
     INDEX_FILENAME = "faiss_index.bin"
     DOC_STORE_FILENAME = "doc_store.pkl"
 
-    # Chunking configuration
+    # Chunking configuration (in # of words)
     CHUNK_SIZE = 256
     CHUNK_OVERLAP = 32
 
     # Dataset configuration
-    DEFAULT_DATASET_PATH = "datasets/cosmopedia-100k"
-    DEFAULT_NUM_DOCUMENTS = 1000
+    DATASET_PATH = "datasets/cosmopedia-100k"
+    NUM_DOCUMENTS = 1000
 
     # Retrieval configuration
-    DEFAULT_TOP_K = 5
+    DEFAULT_TOP_K = 3
 
 
 # ==================== RAG Retriever Class ====================
@@ -52,11 +54,11 @@ class SimpleRagRetriever:
         :param persist_path: path to persist/load index (default from config)
         """
         if model_name is None:
-            model_name = RAGRetrieverConfig.DEFAULT_MODEL_NAME
+            model_name = RAGRetrieverConfig.MODEL_PATH
         if normalize_embeddings is None:
             normalize_embeddings = RAGRetrieverConfig.NORMALIZE_EMBEDDINGS
         if persist_path is None:
-            persist_path = RAGRetrieverConfig.DEFAULT_PERSIST_PATH
+            persist_path = RAGRetrieverConfig.PERSIST_PATH
 
         print("=" * 60)
         print("Initializing RAG Retriever")
@@ -145,85 +147,6 @@ class SimpleRagRetriever:
                 os.remove(self.doc_store_file)
                 print(f"✓ Deleted document store file: {self.doc_store_file}")
 
-    def _chunk_text(
-        self,
-        text: str,
-        chunk_size: int = None,
-        chunk_overlap: int = None
-    ) -> List[str]:
-        """
-        Split text into overlapping chunks
-
-        :param text: text to chunk
-        :param chunk_size: size of each chunk in words (default from config)
-        :param chunk_overlap: overlap between chunks in words (default from config)
-        :return: list of text chunks
-        """
-        if chunk_size is None:
-            chunk_size = RAGRetrieverConfig.CHUNK_SIZE
-        if chunk_overlap is None:
-            chunk_overlap = RAGRetrieverConfig.CHUNK_OVERLAP
-
-        words = text.split()
-        if not words:
-            return []
-
-        if chunk_size <= 0:
-            raise ValueError("chunk_size must be > 0")
-        if chunk_overlap < 0:
-            raise ValueError("chunk_overlap must be >= 0")
-        if chunk_overlap >= chunk_size:
-            raise ValueError("chunk_overlap must be smaller than chunk_size")
-
-        chunks = []
-        step = chunk_size - chunk_overlap
-        for i in range(0, len(words), step):
-            chunk = words[i:i + chunk_size]
-            if chunk:
-                chunks.append(" ".join(chunk))
-
-        return chunks
-
-    def _extract_document_text(self, doc: Any) -> str:
-        """
-        Convert different document formats into plain text for indexing.
-
-        Supported formats:
-        - {"title": ..., "text": ...}
-        - {"text": ...}
-        - {"content": ...}
-        - {"body": ...}
-        - {"document": ...}
-        - raw string
-        """
-        if isinstance(doc, str):
-            return doc.strip()
-
-        if not isinstance(doc, dict):
-            raise TypeError(f"Unsupported document type: {type(doc)}")
-
-        title = doc.get("title", None)
-
-        text = None
-        for key in ["text", "content", "body", "document"]:
-            if key in doc and doc[key] is not None:
-                text = doc[key]
-                break
-
-        if text is None:
-            raise KeyError(
-                f"Cannot find text field in document. Available keys: {list(doc.keys())}"
-            )
-
-        text = str(text).strip()
-        if not text:
-            return ""
-
-        if title is not None and str(title).strip():
-            return f"Title: {str(title).strip()}\n{text}"
-
-        return text
-
     def index_documents(self, documents: List[Any]):
         """
         Index a list of documents.
@@ -254,7 +177,7 @@ class SimpleRagRetriever:
         # Chunk all documents
         for idx, doc in enumerate(documents, 1):
             try:
-                doc_text = self._extract_document_text(doc)
+                doc_text = extract_document_text(doc)
             except Exception as e:
                 print(f"  Warning: skipped document {idx} due to error: {e}")
                 skipped_doc_count += 1
@@ -265,7 +188,11 @@ class SimpleRagRetriever:
                 skipped_doc_count += 1
                 continue
 
-            chunks = self._chunk_text(doc_text)
+            chunks = chunk_words(
+                doc_text,
+                RAGRetrieverConfig.CHUNK_SIZE,
+                RAGRetrieverConfig.CHUNK_OVERLAP,
+            )
             if not chunks:
                 print(f"  Warning: skipped document {idx} because no chunks were produced")
                 skipped_doc_count += 1
@@ -418,9 +345,9 @@ def load_and_index_documents(
     :param force_reindex: force reindexing even if index exists
     """
     if dataset_path is None:
-        dataset_path = RAGRetrieverConfig.DEFAULT_DATASET_PATH
+        dataset_path = RAGRetrieverConfig.DATASET_PATH
     if num_documents is None:
-        num_documents = RAGRetrieverConfig.DEFAULT_NUM_DOCUMENTS
+        num_documents = RAGRetrieverConfig.NUM_DOCUMENTS
 
     # If force_reindex is enabled, clear both memory and persisted files first
     if force_reindex:
@@ -501,7 +428,7 @@ if __name__ == "__main__":
     print("=" * 60)
 
     # 1. Initialize retriever
-    storage_path = RAGRetrieverConfig.DEFAULT_PERSIST_PATH
+    storage_path = RAGRetrieverConfig.PERSIST_PATH
     retriever = SimpleRagRetriever(persist_path=storage_path)
 
     # 2. Load and index documents if needed

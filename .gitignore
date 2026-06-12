@@ -4,3 +4,4 @@ compressed.bin
 __pycache__
 retriever_cache
 temp_img
+submit_slurm.sh
