@@ -1,0 +1,21 @@
+torchrun --nproc_per_node=2 train/train_encoder.py \
+        --data results/rac_c_1k \
+        --model pretrained/SmolLM2-135M \
+        --out results/rac_c_1k/rac_encoder \
+        --k 16 \
+        --k-chunk 4 \
+        --n-latents 128 \
+        --n-heads 8 \
+        --n-layers 1 \
+        --tau 0.4 \
+        --softmin-detach \
+        --seed 42 \
+        --epochs 2 \
+        --queries-per-step 4 \
+        --lr 3e-4 \
+        --weight-decay 0.01 \
+        --grad-clip 1.0 \
+        --log-every 10 \
+        --log-top-k 4 \
+        --wandb \
+        --wandb-project rac

@@ -5,3 +5,6 @@ __pycache__
 retriever_cache
 temp_img
 submit_slurm.sh
+probe_slurm_gpu.sh
+tmp.py
+/results
