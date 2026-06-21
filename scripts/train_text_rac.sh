@@ -1,4 +1,4 @@
-torchrun --nproc_per_node=2 train/train_encoder.py \
+torchrun --nproc_per_node=4 train/train_encoder.py \
         --data results/rac_c_1k \
         --model pretrained/SmolLM2-135M \
         --out results/rac_c_1k/rac_encoder \
@@ -6,7 +6,8 @@ torchrun --nproc_per_node=2 train/train_encoder.py \
         --k-chunk 4 \
         --n-latents 128 \
         --n-heads 8 \
-        --n-layers 1 \
+        --n-layers 2 \
+        --src-layer -2 \
         --tau 0.4 \
         --softmin-detach \
         --seed 42 \

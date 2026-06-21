@@ -8,12 +8,42 @@ prefix via ``PromptContext(mode="embeds")`` — see :class:`RACCompressor`.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from typing import Any, Optional
 
 import torch
 import torch.nn as nn
+
+
+def context_features(
+    model,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    src_layer: Optional[int] = None,
+    amp_dtype=None,
+) -> torch.Tensor:
+    """Per-token features (fp32) for the Perceiver to pool from a base chunk.
+
+    ``src_layer is None`` -> the LM's static input embeddings (context-free, the
+    original behaviour). ``src_layer = int`` -> that frozen LM hidden-state layer
+    (negative indexes from the top); the chunk is run through the LM *body* (no
+    lm_head) so the features are contextualised. Frozen either way — no gradient
+    reaches the LM; gradient flows only into the encoder that pools the result.
+    """
+    if src_layer is None:
+        with torch.no_grad():
+            return model.get_input_embeddings()(input_ids).float()
+
+    body = getattr(model, "model", model)   # base transformer, skips the lm_head
+    autocast = (torch.autocast(device_type="cuda", dtype=amp_dtype)
+                if amp_dtype is not None and input_ids.device.type == "cuda"
+                else contextlib.nullcontext())
+    with torch.no_grad(), autocast:
+        out = body(input_ids=input_ids, attention_mask=attention_mask,
+                   output_hidden_states=True)
+    return out.hidden_states[src_layer].float()
 
 
 class _PerceiverBlock(nn.Module):
@@ -62,13 +92,17 @@ class ChunkEncoder(nn.Module):
         n_layers: int = 2,
         ff_mult: int = 4,
         dropout: float = 0.0,
+        src_layer: Optional[int] = None,
     ):
         super().__init__()
         self.config = dict(
             hidden_size=hidden_size, n_latents=n_latents,
             n_heads=n_heads, n_layers=n_layers,
-            ff_mult=ff_mult, dropout=dropout,
+            ff_mult=ff_mult, dropout=dropout, src_layer=src_layer,
         )
+        # which LM features the encoder pools (None = static embeddings); the
+        # caller (per_pair_ce / RACCompressor) reads this to stay train/eval-consistent
+        self.src_layer = src_layer
 
         self.latents = nn.Parameter(torch.randn(n_latents, hidden_size) * 0.02)
         self.blocks = nn.ModuleList(

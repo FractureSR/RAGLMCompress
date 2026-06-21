@@ -54,11 +54,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ["WANDB_MODE"] = "offline"
 
 from utils.rag_utils import load_splits_from_cache, load_retrieval_cache
 from utils.text_utils import pad_token_ids
-from compression.rac_encoder import ChunkEncoder
+from compression.rac_encoder import ChunkEncoder, context_features
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +116,7 @@ def _autocast(device, amp_dtype):
 def per_pair_ce(
     model, encoder,
     ctx_ids_lists: List[List[int]], data_ids_lists: List[List[int]],
-    pad_id: int, device, amp_dtype=None,
+    pad_id: int, device, amp_dtype=None, src_layer=None,
 ) -> torch.Tensor:
     """Cross-entropy (nats/token) for a flat batch of (context-chunk, data) pairs.
 
@@ -126,9 +125,8 @@ def per_pair_ce(
     """
     # --- encode the context chunks into latent prefixes ---
     ctx_ids, ctx_mask = pad_token_ids(ctx_ids_lists, pad_id, device=device)
-    with torch.no_grad():
-        ctx_emb = model.get_input_embeddings()(ctx_ids)
-    latents = encoder(ctx_emb, ctx_mask)                      # [P, n_lat, H]
+    ctx_feats = context_features(model, ctx_ids, ctx_mask, src_layer, amp_dtype)
+    latents = encoder(ctx_feats, ctx_mask)                    # [P, n_lat, H]
     n_lat = latents.shape[1]
 
     # --- frozen LM forward on [latents | data] ---
@@ -212,6 +210,7 @@ def train(args) -> None:
     encoder = ChunkEncoder(
         hidden_size=hidden, n_latents=args.n_latents,
         n_heads=args.n_heads, n_layers=args.n_layers, dropout=args.dropout,
+        src_layer=args.src_layer,
     ).to(device)
     if distributed:
         # DDP broadcasts rank-0 init so every replica starts identical.
@@ -260,7 +259,7 @@ def train(args) -> None:
                 # single-pass: original behaviour
                 encoder.train()
                 ctx_lists, data_lists = _pairs_for_k_slice(batch_q, 0, args.k)
-                ce = per_pair_ce(model, encoder, ctx_lists, data_lists, pad_id, device, amp_dtype)
+                ce = per_pair_ce(model, encoder, ctx_lists, data_lists, pad_id, device, amp_dtype, args.src_layer)
                 L = ce.view(Q, args.k)
                 w = torch.softmax(-L / args.tau, dim=1)
                 if args.softmin_detach:
@@ -277,7 +276,7 @@ def train(args) -> None:
                     for j0 in range(0, args.k, k_chunk):
                         j1 = min(j0 + k_chunk, args.k)
                         ctx_lists, data_lists = _pairs_for_k_slice(batch_q, j0, j1)
-                        ce = per_pair_ce(model, raw_encoder, ctx_lists, data_lists, pad_id, device, amp_dtype)
+                        ce = per_pair_ce(model, raw_encoder, ctx_lists, data_lists, pad_id, device, amp_dtype, args.src_layer)
                         L_parts.append(ce.view(Q, j1 - j0))
                 L = torch.cat(L_parts, dim=1)          # [Q, k]
                 # weights are detached: they span all chunks so can't backprop through them
@@ -296,7 +295,7 @@ def train(args) -> None:
                                 else contextlib.nullcontext())
                     with sync_ctx:
                         ctx_lists, data_lists = _pairs_for_k_slice(batch_q, j0, j1)
-                        ce = per_pair_ce(model, encoder, ctx_lists, data_lists, pad_id, device, amp_dtype)
+                        ce = per_pair_ce(model, encoder, ctx_lists, data_lists, pad_id, device, amp_dtype, args.src_layer)
                         ce = ce.view(Q, j1 - j0)
                         chunk_loss = (w[:, j0:j1] * ce).sum(1).mean()
                         chunk_loss.backward()
@@ -397,7 +396,7 @@ def dump_ce_cache(args, model, encoder, base_tok, queries, pad_id, device,
                 ctx_lists.append(base_tok[cid])
                 data_lists.append(q["data"])
                 owner.append((qi, cid))
-        ce = per_pair_ce(model, encoder, ctx_lists, data_lists, pad_id, device, amp_dtype)
+        ce = per_pair_ce(model, encoder, ctx_lists, data_lists, pad_id, device, amp_dtype, args.src_layer)
         per_q: Dict[int, Dict[str, float]] = {
             qi: {} for qi in range(len(batch))}
         for (qi, cid), val in zip(owner, ce.tolist()):
@@ -436,6 +435,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--n-latents", type=int, default=8)
     p.add_argument("--n-heads", type=int, default=8)
     p.add_argument("--n-layers", type=int, default=2)
+    p.add_argument("--src-layer", type=int, default=None,
+                   help="Frozen LM hidden-state layer to pool for context features "
+                        "(negative = from the top, e.g. -1 = last); omit for static "
+                        "input embeddings (original behaviour)")
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--dtype", choices=["bf16", "fp32"], default="bf16",
                    help="LM forward compute dtype; bf16 enables tensor cores + FlashAttention")
