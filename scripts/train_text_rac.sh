@@ -1,7 +1,7 @@
 torchrun --nproc_per_node=4 train/train_encoder.py \
         --data results/rac_c_1k \
         --model pretrained/SmolLM2-135M \
-        --out results/rac_c_1k/rac_encoder \
+        --out results/rac_c_1k/rac_encoder_run2 \
         --k 16 \
         --k-chunk 4 \
         --n-latents 128 \
@@ -11,7 +11,7 @@ torchrun --nproc_per_node=4 train/train_encoder.py \
         --tau 0.4 \
         --softmin-detach \
         --seed 42 \
-        --epochs 2 \
+        --epochs 4 \
         --queries-per-step 4 \
         --lr 3e-4 \
         --weight-decay 0.01 \

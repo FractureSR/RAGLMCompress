@@ -21,29 +21,39 @@ def context_features(
     model,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
-    src_layer: Optional[int] = None,
+    src_layer=None,
     amp_dtype=None,
+    trainable: bool = False,
 ) -> torch.Tensor:
     """Per-token features (fp32) for the Perceiver to pool from a base chunk.
 
-    ``src_layer is None`` -> the LM's static input embeddings (context-free, the
-    original behaviour). ``src_layer = int`` -> that frozen LM hidden-state layer
-    (negative indexes from the top); the chunk is run through the LM *body* (no
-    lm_head) so the features are contextualised. Frozen either way — no gradient
-    reaches the LM; gradient flows only into the encoder that pools the result.
+    ``src_layer``:
+      * ``None``      -> the LM's static input embeddings (context-free, original).
+      * ``int``       -> that frozen LM hidden-state layer (negative = from top).
+      * ``list[int]`` -> stack of those layers -> ``[B, L, n_sel, H]`` for the
+                         encoder to combine with learned weights (len-1 collapses
+                         to a single layer).
+    The chunk runs through the LM *body* (no lm_head). ``trainable=True`` keeps the
+    forward in the autograd graph so gradient can reach LoRA adapters on the LM
+    (encoder-side LoRA); otherwise it runs under ``no_grad`` (frozen, cheaper).
     """
     if src_layer is None:
         with torch.no_grad():
             return model.get_input_embeddings()(input_ids).float()
 
+    layers = [src_layer] if isinstance(src_layer, int) else list(src_layer)
     body = getattr(model, "model", model)   # base transformer, skips the lm_head
+    grad_ctx = contextlib.nullcontext() if trainable else torch.no_grad()
     autocast = (torch.autocast(device_type="cuda", dtype=amp_dtype)
                 if amp_dtype is not None and input_ids.device.type == "cuda"
                 else contextlib.nullcontext())
-    with torch.no_grad(), autocast:
+    with grad_ctx, autocast:
         out = body(input_ids=input_ids, attention_mask=attention_mask,
                    output_hidden_states=True)
-    return out.hidden_states[src_layer].float()
+    hs = out.hidden_states
+    if len(layers) == 1:
+        return hs[layers[0]].float()                              # [B, L, H]
+    return torch.stack([hs[l] for l in layers], dim=2).float()    # [B, L, n_sel, H]
 
 
 class _PerceiverBlock(nn.Module):
@@ -92,7 +102,7 @@ class ChunkEncoder(nn.Module):
         n_layers: int = 2,
         ff_mult: int = 4,
         dropout: float = 0.0,
-        src_layer: Optional[int] = None,
+        src_layer=None,
     ):
         super().__init__()
         self.config = dict(
@@ -100,9 +110,24 @@ class ChunkEncoder(nn.Module):
             n_heads=n_heads, n_layers=n_layers,
             ff_mult=ff_mult, dropout=dropout, src_layer=src_layer,
         )
-        # which LM features the encoder pools (None = static embeddings); the
-        # caller (per_pair_ce / RACCompressor) reads this to stay train/eval-consistent
+        # which LM features the encoder pools (None = static embeddings, int = one
+        # hidden layer, list = several); the caller (per_pair_ce / RACCompressor)
+        # reads this to stay train/eval-consistent
         self.src_layer = src_layer
+        # learned softmax mix over multiple layers when src_layer is a list of >1.
+        # Init favours the *last-listed* layer (convention: pass src_layer
+        # shallow->deep) so the encoder starts ~= the deepest layer alone -- the
+        # proven single-layer config -- and only blends in the shallower layers if
+        # they help. Same "init as a no-op delta on a known-good point" idea as
+        # LoRA B=0; uniform (zeros) init instead starts on the *mean* of all
+        # layers, diluting the good deep features and slowing the climb.
+        n_combine = len(src_layer) if isinstance(src_layer, (list, tuple)) and len(src_layer) > 1 else 0
+        if n_combine:
+            init = torch.zeros(n_combine)
+            init[-1] = 3.0          # softmax([0, 0, 3]) ~= [.045, .045, .909]
+            self.layer_combine = nn.Parameter(init)
+        else:
+            self.layer_combine = None
 
         self.latents = nn.Parameter(torch.randn(n_latents, hidden_size) * 0.02)
         self.blocks = nn.ModuleList(
@@ -112,9 +137,12 @@ class ChunkEncoder(nn.Module):
 
     def forward(
         self,
-        embeds: torch.Tensor,                           # [B, L, hidden_size]
+        embeds: torch.Tensor,                           # [B, L, H] or [B, L, n_sel, H]
         attention_mask: Optional[torch.Tensor] = None,  # [B, L]  1 = keep, 0 = pad
     ) -> torch.Tensor:                                  # [B, n_latents, hidden_size]
+        if embeds.dim() == 4:                           # multi-layer -> learned mix
+            w = torch.softmax(self.layer_combine, dim=0)
+            embeds = (embeds * w.view(1, 1, -1, 1)).sum(dim=2)
         B = embeds.shape[0]
         latents = self.latents.unsqueeze(0).expand(B, -1, -1)
         # MultiheadAttention expects True where a key should be *ignored*.

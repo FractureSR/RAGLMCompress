@@ -133,8 +133,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--k", type=int, default=None, help="Candidate pool from cache (default: all)")
     p.add_argument("--n-test", type=int, default=None, help="Limit test docs")
     p.add_argument("--batch-size", type=int, default=16)
-    p.add_argument("--data-max-tokens", type=int, default=256)
-    p.add_argument("--ctx-max-tokens", type=int, default=256)
     p.add_argument("--token-rag-max-ctx", type=int, default=1024)
     p.add_argument("--no-decompress", action="store_true")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -157,8 +155,8 @@ def main() -> None:
 
     # --- load split + retrieval cache ---
     base, _, test = load_splits_from_cache(args.data)
-    base_tok = tokenizer([b["text"] for b in base], add_special_tokens=False,
-                         truncation=True, max_length=args.ctx_max_tokens)["input_ids"]
+    base_tok = tokenizer([b["text"] for b in base],
+                         add_special_tokens=False)["input_ids"]
     llm_base_tok = base_tok
     n_base = len(base_tok)
 
@@ -166,18 +164,17 @@ def main() -> None:
 
     samples: List[dict] = []
     need_ctx = any(meth in ("rac", "rac_rerank", "token_rag") for meth in methods)
-    for t in test:
-        cands = retr.get(str(t["id"]), [])
+    for p in test:
+        cands = retr.get(str(p["id"]), [])
         if args.k:
             cands = cands[: args.k]
         if need_ctx and len(cands) < 1:
             continue
-        ids = tokenizer(t["text"], add_special_tokens=False, truncation=True,
-                        max_length=args.data_max_tokens)["input_ids"]
+        ids = tokenizer(p["text"], add_special_tokens=False)["input_ids"]
         if len(ids) < 2:
             continue
-        samples.append({"id": t["id"], "data": ids, "cands": cands,
-                        "orig_b": len(t["text"].encode())})
+        samples.append({"id": p["id"], "data": ids, "cands": cands,
+                        "orig_b": len(p["text"].encode())})
         if args.n_test and len(samples) >= args.n_test:
             break
     samples.sort(key=lambda x: len(x["data"]))

@@ -54,6 +54,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+os.environ["WANDB_MODE"] = "offline"
 
 from utils.rag_utils import load_splits_from_cache, load_retrieval_cache
 from utils.text_utils import pad_token_ids
@@ -113,6 +114,15 @@ def _autocast(device, amp_dtype):
     return contextlib.nullcontext()
 
 
+def _frozen_lm(model):
+    """Disable LoRA adapters so the LM acts as the raw frozen backbone.
+
+    Used on the *compression* side (and the no-context baseline) so those stay
+    identical to the pretrained LM even when encoder-side LoRA is active.
+    """
+    return model.disable_adapter() if hasattr(model, "disable_adapter") else contextlib.nullcontext()
+
+
 def per_pair_ce(
     model, encoder,
     ctx_ids_lists: List[List[int]], data_ids_lists: List[List[int]],
@@ -124,19 +134,21 @@ def per_pair_ce(
     ``[P]`` tensor of per-pair data CE.  Differentiable w.r.t. the encoder.
     """
     # --- encode the context chunks into latent prefixes ---
+    # encoder-side LM forward: adapter ACTIVE (and grad-enabled) when LoRA is on
+    lora_on = hasattr(model, "disable_adapter")
     ctx_ids, ctx_mask = pad_token_ids(ctx_ids_lists, pad_id, device=device)
-    ctx_feats = context_features(model, ctx_ids, ctx_mask, src_layer, amp_dtype)
+    ctx_feats = context_features(model, ctx_ids, ctx_mask, src_layer, amp_dtype, trainable=lora_on)
     latents = encoder(ctx_feats, ctx_mask)                    # [P, n_lat, H]
     n_lat = latents.shape[1]
 
-    # --- frozen LM forward on [latents | data] ---
+    # --- frozen LM forward on [latents | data] (adapter OFF: raw backbone) ---
     data_ids, data_mask = pad_token_ids(data_ids_lists, pad_id, device=device)
     Ld = data_ids.shape[1]
     with torch.no_grad():
         data_emb = model.get_input_embeddings()(data_ids)
     full = torch.cat([latents, data_emb.to(latents.dtype)], dim=1)
     # [P, n_lat+Ld, V]
-    with _autocast(device, amp_dtype):
+    with _frozen_lm(model), _autocast(device, amp_dtype):
         logits = model(inputs_embeds=full, use_cache=False).logits
 
     # logits[:, n_lat-1 + i] predicts data token i; .float() keeps CE in fp32
@@ -153,7 +165,7 @@ def no_context_ce(model, data_ids_lists, pad_id, device, amp_dtype=None) -> torc
     bos = model.config.bos_token_id or 0
     full_lists = [[bos] + ids for ids in data_ids_lists]
     ids, mask = pad_token_ids(full_lists, pad_id, device=device)
-    with torch.no_grad(), _autocast(device, amp_dtype):
+    with torch.no_grad(), _frozen_lm(model), _autocast(device, amp_dtype):
         logits = model(ids, use_cache=False).logits.float()
     # predict positions 1..Ld from logits 0..Ld-1
     pred = logits[:, :-1, :]
@@ -203,6 +215,29 @@ def train(args) -> None:
     if is_main:
         print(f"LM forward dtype: {args.dtype}")
 
+    # --- optional encoder-side LoRA (compression side stays the raw frozen LM) ---
+    lora_params: List[torch.nn.Parameter] = []
+    if args.lora:
+        from peft import LoraConfig, get_peft_model
+        lcfg = LoraConfig(
+            r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
+            target_modules=[t.strip() for t in args.lora_targets.split(",")],
+            bias="none", task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, lcfg)
+        model.to(device)
+        lora_params = [p for p in model.parameters() if p.requires_grad]
+        # The LM isn't DDP-wrapped, so (unlike the encoder) nothing broadcasts its
+        # init. LoRA A is random per-rank -> broadcast rank-0's weights so every
+        # replica starts identical; the per-step all_reduce then keeps them in sync.
+        if distributed:
+            for p in lora_params:
+                dist.broadcast(p.data, src=0)
+        if is_main:
+            n_tr = sum(p.numel() for p in lora_params)
+            print(f"LoRA: r={args.lora_r} alpha={args.lora_alpha} on {args.lora_targets} "
+                  f"| {n_tr/1e6:.3f}M adapter params (compression side stays frozen)")
+
     # base_tok: List[List[int]]
     # queries: List[Dict[str, Any]], each dict has "id": int, "data": List[int], "ctx": List[int]
     base_tok, queries = load_training_data(args, tokenizer)
@@ -216,7 +251,9 @@ def train(args) -> None:
         # DDP broadcasts rank-0 init so every replica starts identical.
         encoder = DDP(encoder, device_ids=[local_rank])
     raw_encoder = encoder.module if distributed else encoder
-    opt = torch.optim.AdamW(raw_encoder.parameters(),
+    # encoder is DDP-synced; LoRA params (inside the unwrapped LM) are all-reduced
+    # manually before each opt.step (see below).
+    opt = torch.optim.AdamW([*raw_encoder.parameters(), *lora_params],
                             lr=args.lr, weight_decay=args.weight_decay)
 
     wb = None
@@ -302,8 +339,14 @@ def train(args) -> None:
                         step_loss += chunk_loss.item()
                 running += step_loss
 
+            # DDP syncs the encoder during backward; LoRA params live in the
+            # unwrapped LM, so average their grads across ranks here, once per step.
+            if distributed and lora_params:
+                for p in lora_params:
+                    if p.grad is not None:
+                        dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
             grad_norm = torch.nn.utils.clip_grad_norm_(
-                raw_encoder.parameters(), args.grad_clip)
+                [*raw_encoder.parameters(), *lora_params], args.grad_clip)
             opt.step()
 
             step += 1
@@ -354,6 +397,8 @@ def train(args) -> None:
         # save each epoch (rank 0 only; ranks are in sync at the epoch boundary)
         if is_main:
             raw_encoder.save_pretrained(args.out)
+            if args.lora:
+                model.save_pretrained(os.path.join(args.out, "lora_adapter"))
             print(f"[epoch {epoch}] encoder saved -> {args.out}")
             if wb is not None:
                 wb.log({"epoch": epoch, "epoch_complete": True}, step=step)
@@ -383,6 +428,10 @@ def dump_ce_cache(args, model, encoder, base_tok, queries, pad_id, device,
     local_queries = queries[rank::world_size] if world_size > 1 else queries
     cache: Dict[str, dict] = {}
     bs = max(1, args.queries_per_step)
+    # cap pairs per LM forward to the training peak (Q * k_chunk); this pass is
+    # no-grad, so if training fit, the cache pass fits too.
+    k_chunk = args.k_chunk if args.k_chunk is not None else args.k
+    pair_bs = max(1, bs * k_chunk)
     t0 = time.time()
     steps = range(0, len(local_queries), bs)
     if is_main:
@@ -396,7 +445,11 @@ def dump_ce_cache(args, model, encoder, base_tok, queries, pad_id, device,
                 ctx_lists.append(base_tok[cid])
                 data_lists.append(q["data"])
                 owner.append((qi, cid))
-        ce = per_pair_ce(model, encoder, ctx_lists, data_lists, pad_id, device, amp_dtype, args.src_layer)
+        ce = torch.cat([
+            per_pair_ce(model, encoder, ctx_lists[i:i + pair_bs], data_lists[i:i + pair_bs],
+                        pad_id, device, amp_dtype, args.src_layer)
+            for i in range(0, len(ctx_lists), pair_bs)
+        ])
         per_q: Dict[int, Dict[str, float]] = {
             qi: {} for qi in range(len(batch))}
         for (qi, cid), val in zip(owner, ce.tolist()):
@@ -435,13 +488,22 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--n-latents", type=int, default=8)
     p.add_argument("--n-heads", type=int, default=8)
     p.add_argument("--n-layers", type=int, default=2)
-    p.add_argument("--src-layer", type=int, default=None,
-                   help="Frozen LM hidden-state layer to pool for context features "
-                        "(negative = from the top, e.g. -1 = last); omit for static "
-                        "input embeddings (original behaviour)")
+    p.add_argument("--src-layer", type=int, nargs="+", default=None,
+                   help="Frozen LM hidden-state layer(s) to pool for context features "
+                        "(negative = from the top, e.g. -1 = last). Pass several for a "
+                        "learned weighted combination (e.g. --src-layer -1 -2 -3 -4); "
+                        "omit for static input embeddings (original behaviour)")
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--dtype", choices=["bf16", "fp32"], default="bf16",
                    help="LM forward compute dtype; bf16 enables tensor cores + FlashAttention")
+    p.add_argument("--lora", action="store_true",
+                   help="Adapt the encoder-side LM forward with LoRA (requires --src-layer; "
+                        "the compression side stays the raw frozen LM, so the baseline is unchanged)")
+    p.add_argument("--lora-r", type=int, default=16)
+    p.add_argument("--lora-alpha", type=int, default=32)
+    p.add_argument("--lora-dropout", type=float, default=0.0)
+    p.add_argument("--lora-targets", default="q_proj,k_proj,v_proj,o_proj",
+                   help="Comma-separated module names to adapt with LoRA")
     p.add_argument("--tau", type=float, default=0.5,
                    help="Softmin temperature (nats)")
     p.add_argument("--softmin-detach", action="store_true", default=False,
