@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import warnings
 import torch
 from dataclasses import dataclass
 from itertools import islice
@@ -193,6 +194,12 @@ def _load_codeparrot_github_code_Java(path: str, n: Optional[int] = None, skip: 
 def _load_codeparrot_github_code_Python(path: str, n: Optional[int] = None, skip: int = 0) -> List[str]:
     return _load_jsonl(path, ("code",), n, skip)
 
+
+@register_text_loader("eval_docs.jsonl")
+def _load_rac_eval_docs(path: str, n: Optional[int] = None, skip: int = 0) -> List[str]:
+    """Held-out eval docs persisted by prepare_rac_data.py (one {"text": ...} per line)."""
+    return _load_jsonl(path, ("text",), n, skip)
+
 # ---------------------------------------------------------------------------
 # Compression preprocessing
 # ---------------------------------------------------------------------------
@@ -220,6 +227,7 @@ def chunk_documents_for_compression(
     max_tokens: int,
     chunk_overlap: int = 0,
     decode: bool = False,
+    align_last_window: bool = False,
 ) -> List[TextChunk]:
     """Split documents into ≤ max_tokens token windows (length set by *tokenizer*).
 
@@ -228,6 +236,13 @@ def chunk_documents_for_compression(
     ``decode=True`` to also fill each chunk's ``text`` field — needed when the
     chunk is consumed as text (e.g. a retrieval unit embedded by a *different*
     tokenizer). Pure preprocessing step — no compression logic involved.
+
+    ``align_last_window``: make *every* window exactly ``max_tokens`` long by
+    sliding the final (short) window backward so it ends at the document's last
+    token (overlapping the previous window). Use this for the RAC base/retrieval
+    units so all conditions share one length and can be batched with a single
+    ``prefix_length``. A document shorter than ``max_tokens`` can't be aligned —
+    it is emitted as-is with a warning (unexpected for a base corpus).
     """
     if chunk_overlap < 0 or chunk_overlap >= max_tokens:
         raise ValueError("require 0 <= chunk_overlap < max_tokens")
@@ -242,6 +257,13 @@ def chunk_documents_for_compression(
         windows = [ids[s: s + max_tokens] for s in range(0, len(ids), step)]
         if not windows:
             windows = [[]]
+        if align_last_window and len(windows[-1]) < max_tokens:
+            if len(ids) >= max_tokens:
+                windows[-1] = ids[-max_tokens:]   # slide back to a full window
+            else:
+                warnings.warn(
+                    f"align_last_window: document {doc_idx} has {len(ids)} < "
+                    f"max_tokens={max_tokens} tokens — emitted unaligned")
         n = len(windows)
         for chunk_idx, window in enumerate(windows):
             chunks.append(TextChunk(
@@ -342,19 +364,32 @@ def make_text_retriever(
     rrf_k: int = 60,
     batch_size: int = 64,
     query_batch_size: Optional[int] = None,
+    signals: str = "bm25",
 ):
-    """Construct an *unbuilt* :class:`Retriever` with BM25 + Qwen3 dense scorers.
+    """Construct an *unbuilt* :class:`Retriever` from the requested signal(s).
+
+    ``signals``:
+      * ``"bm25"``   — lexical/syntactic only (no embedding model loaded; this is
+                       the RAC default — claim 2.1.1: re-encoding x favours
+                       *syntactic* matches over semantic ones).
+      * ``"dense"``  — Qwen3 semantic only.
+      * ``"hybrid"`` — both, fused with RRF.
 
     ``batch_size`` embeds the base corpus at build time; ``query_batch_size``
-    (default = ``batch_size``) embeds queries at retrieval time — set it smaller
-    when queries are much longer than base chunks (avoids GPU OOM). The same
-    factory must be used for build and load (callables aren't persisted).
+    (default = ``batch_size``) embeds queries at retrieval time. The same factory
+    (same ``signals``) must be used for build and load (callables aren't persisted).
     """
     from utils.rag_utils import Retriever, BM25Scorer, DenseScorer
-    bm25 = BM25Scorer(tokenize=bm25_tokenize)
-    dense = DenseScorer(embed=make_text_dense_embedder(embed_model, device, batch_size),
-                        query_batch_size=query_batch_size)
-    return Retriever([bm25, dense], rrf_k=rrf_k)
+    scorers = []
+    if signals in ("bm25", "hybrid"):
+        scorers.append(BM25Scorer(tokenize=bm25_tokenize))
+    if signals in ("dense", "hybrid"):
+        scorers.append(DenseScorer(
+            embed=make_text_dense_embedder(embed_model, device, batch_size),
+            query_batch_size=query_batch_size))
+    if not scorers:
+        raise ValueError(f"unknown signals {signals!r}; use bm25|dense|hybrid")
+    return Retriever(scorers, rrf_k=rrf_k)
 
 
 # Note: Possibly padding for bs > 1 could introduce new precision problems

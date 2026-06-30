@@ -12,12 +12,13 @@ mirroring the prefill pass.
 """
 from __future__ import annotations
 
+import math
 from typing import List, Optional, Tuple
 
 import torch
 
 from compression.base_compressor import BaseCompressor
-from compression.types import CompressedData
+from compression.types import CompressedData, LMScore
 from utils.bgpt_codec_utils import (
     PAD_TOKEN, VOCAB_SIZE,
     bytes_to_padded_tokens, extension_tokens,
@@ -41,19 +42,17 @@ class BGPTCompressor(BaseCompressor):
     # Public API
     # ------------------------------------------------------------------
 
-    def compress_batch(
+    def _prefill(
         self, segments: List[Tuple[bytes, str]]
-    ) -> List[CompressedData]:
-        """Compress multiple segments in a single forward pass.
+    ) -> Tuple[dict, torch.Tensor, List[int]]:
+        """Single forward over a padded batch of segments.
 
-        Segments with different byte lengths (e.g. the last audio chunk) are
-        padded to the longest payload in the batch with PAD_TOKEN.  Each
-        CompressedData stores the actual original_length so the decoder knows
-        how many tokens to recover.
+        Returns ``(padded, logits_per_sample, orig_lengths)`` where ``padded`` is
+        the bGPT model input, ``logits_per_sample[b, i]`` predicts payload token
+        ``i`` of sample ``b``, and ``orig_lengths[b]`` is the sample's true
+        (pre-padding) payload length. Shared by :meth:`compress_batch` (range
+        coding) and :meth:`score_batch` (NLL only).
         """
-        if not segments:
-            return []
-
         ext_ids_list  = [extension_tokens(ext, self.patch_size) for _, ext in segments]
         payload_list  = [bytes_to_padded_tokens(raw, self.patch_size) for raw, _ in segments]
         orig_lengths  = [len(p) for p in payload_list]
@@ -79,6 +78,22 @@ class BGPTCompressor(BaseCompressor):
         logits_4d         = logits_raw.reshape(B, pairs_per_sample, self.patch_size + 1, VOCAB_SIZE)
         # (B, max_orig_len, VOCAB) — slice per sample below to its actual length
         logits_per_sample = logits_4d[:, :-1, :-1, :].reshape(B, -1, VOCAB_SIZE)
+        return padded, logits_per_sample, orig_lengths
+
+    def compress_batch(
+        self, segments: List[Tuple[bytes, str]]
+    ) -> List[CompressedData]:
+        """Compress multiple segments in a single forward pass.
+
+        Segments with different byte lengths (e.g. the last audio chunk) are
+        padded to the longest payload in the batch with PAD_TOKEN.  Each
+        CompressedData stores the actual original_length so the decoder knows
+        how many tokens to recover.
+        """
+        if not segments:
+            return []
+
+        padded, logits_per_sample, orig_lengths = self._prefill(segments)
 
         results = []
         for b, (_, ext) in enumerate(segments):
@@ -93,6 +108,27 @@ class BGPTCompressor(BaseCompressor):
             cd.metadata["ext"] = ext.lower().lstrip(".")
             results.append(cd)
 
+        return results
+
+    def score_batch(self, segments: List[Tuple[bytes, str]]) -> List[LMScore]:
+        """Code length (bits) + per-token NLL per segment — no range coding.
+
+        The score-only counterpart of :meth:`compress_batch` (shares
+        :meth:`_prefill`), mirroring ``LLMCompressor.score_batch`` so byte-domain
+        callers can rank inputs by exact code length without paying for coding.
+        """
+        if not segments:
+            return []
+
+        padded, logits_per_sample, orig_lengths = self._prefill(segments)
+
+        results: List[LMScore] = []
+        for b in range(len(segments)):
+            orig_len = orig_lengths[b]
+            target = padded["patches"][b, self.patch_size: self.patch_size + orig_len]   # [orig_len]
+            lg = logits_per_sample[b, :orig_len, :]                                       # [orig_len, V]
+            nll = -lg.log_softmax(dim=-1).gather(1, target.unsqueeze(1)).squeeze(1)
+            results.append(LMScore(bits=float(nll.sum().item()) / math.log(2), token_nll=nll))
         return results
 
     def decompress_batch(

@@ -7,3 +7,4 @@ temp_img
 submit_slurm.sh
 probe_slurm_gpu.sh
 /results
+/.vscode

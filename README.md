@@ -20,45 +20,35 @@ images, and audio.
 
 ## RAC (Retrieval-Augmented Compression)
 
-Compress domain data conditioned on patterns retrieved from a base corpus. The
-frozen LM still produces the coding distribution; retrieval supplies a learned
-conditioning prefix that lowers the data's entropy.
+Compress data by conditioning the frozen LM on the raw tokens of similar chunks
+retrieved from a base corpus **using the data itself**. RAC ≠ RAG: we already
+have the data `x`, retrieve with `x`, and re-encode `x` more cheaply. Because we
+are compressing we can *measure* each candidate's exact effect on the code length
+and keep the **oracle** (best of top-k) — or no condition if none beats its
+side-info cost. No training.
 
-Pipeline (text):
-
-The base/train/test split is reproduced deterministically from the `--dataset`
-and split args (`--chunk-size/--base-frac/--train-frac/--seed`), so it is never
-persisted — pass the *same* dataset/split args to every step.  Only the expensive
-retriever + retrieval caches are saved (in `prepare`'s `--out`, referenced as
-`--data` by the later steps).  Defaults match across scripts, so the short form
-below is consistent.
+Pipeline (text) — no training, no precomputed retrieval:
 
 ```
-DS="--dataset datasets/cosmopedia-100k --n-docs 2000"   # + any --chunk-size/--base-frac/... overrides
+# 1. Build the retrieval database: fix a slice of the dataset as the base corpus,
+#    chunk it, and index it (BM25 syntactic by default; no embedding model needed).
+python utils/prepare_rac_data.py \
+    --dataset datasets/codeparrot_github_code/C.jsonl --n-docs 4000 \
+    --base-frac 0.5 --chunk-size 512 --retriever bm25 \
+    --model pretrained/SmolLM2-135M --out results/rac_c_db
 
-# 1. Build the retriever (BM25 + Qwen3-Embedding, fused with RRF) over the i.i.d.
-#    base and cache top-k retrieval for the train/test queries.
-python train/prepare_rac_data.py $DS --top-k 32 --out datasets/rac/cosmopedia
-
-# 2. Train the ChunkEncoder (softmin-weighted per-chunk cross-entropy). This also
-#    dumps a CE cache (into --data) used as reranker labels.
-python train/train_encoder.py $DS --data datasets/rac/cosmopedia \
-    --model pretrained/SmolLM2-135M --out pretrained/rac_encoder/cosmopedia
-
-# 3. Train the Reranker on the cached marginal CE reductions.
-python train/train_reranker.py $DS --data datasets/rac/cosmopedia \
-    --model pretrained/SmolLM2-135M --out pretrained/rac_reranker/cosmopedia
-
-# 4. Evaluate RAC vs baselines on the test split.
-python evaluation/eval_rac.py $DS --data datasets/rac/cosmopedia \
-    --model pretrained/SmolLM2-135M --encoder pretrained/rac_encoder/cosmopedia \
-    --reranker pretrained/rac_reranker/cosmopedia --methods none,token_rag,rac,rac_rerank
+# 2. Evaluate oracle RAC vs the no-condition baseline on the held-out docs,
+#    chunked + retrieved live (mirrors eval_llm). Add --cascade / --calibrate.
+python evaluation/eval_rac.py --database results/rac_c_db \
+    --model pretrained/SmolLM2-135M --m 16 --n-docs 200 --device cuda:0
 ```
 
-The RAC components (`rag_utils`, `ChunkEncoder`, `Reranker`, `RACCompressor`) are
-written against injected interfaces (a backbone compressor, an embedding source,
-pluggable retrieval scorers) so the planned audio/image-on-bGPT variant can reuse
-them once `BGPTCompressor` gains an `inputs_embeds` path.
+The chosen base ids are transmitted as side information (the decoder can't re-run
+retrieval — the query is the unknown data); their bit cost (fixed, or a static
+table built with `--calibrate`) is charged for honest bpb/ratio. The retriever
+(`utils/rag_utils.py`) and the oracle compressor (`compression/rac_compressor.py`)
+are modality-agnostic, so the planned audio/image-on-bGPT variant reuses them once
+`BGPTCompressor` grows a byte-prefix path.
 
 ## Notes
 

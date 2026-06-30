@@ -1,14 +1,15 @@
-python train/prepare_rac_data.py \
+#!/usr/bin/env bash
+# Build the RAC retrieval database (base corpus + index). No training, no test
+# pieces, no precomputed retrieval — eval_rac.py chunks + retrieves the held-out
+# eval docs live.
+set -euo pipefail
+
+python utils/prepare_rac_data.py \
     --dataset datasets/codeparrot_github_code/C.jsonl \
-    --modality text \
-    --data-chunk-size 1024 \
-    --chunk-size 512 \
-    --chunk-overlap 0 \
-    --base-frac 0.5 --train-frac 0.9 \
+    --n-docs 4000 \
+    --base-frac 0.5 \
+    --chunk-size 512 --chunk-overlap 0 \
+    --retriever bm25 \
     --seed 42 \
-    --out results/rac_c_1k \
     --model pretrained/SmolLM2-135M \
-    --top-k 16 \
-    --embed-model pretrained/Qwen3-Embedding-0.6B \
-    --embed-batch-size 32 --embed-query-batch-size 4 \
-    --device cuda:0 --rrf-k 60
+    --out results/rac_c_db

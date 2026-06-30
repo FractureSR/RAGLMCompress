@@ -20,13 +20,14 @@ Decompress path (iterative, with padding trick):
 """
 from __future__ import annotations
 
-from typing import List, Optional
+import math
+from typing import List, Optional, Tuple
 
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from compression.base_compressor import BaseCompressor
-from compression.types import CompressedData, PromptContext
+from compression.types import CompressedData, LMScore, PromptContext
 
 
 class LLMCompressor(BaseCompressor):
@@ -43,28 +44,32 @@ class LLMCompressor(BaseCompressor):
         self.model.eval()
 
     # ------------------------------------------------------------------
-    # Batch API  (bs=1 is the degenerate case — pass a [1, L] tensor)
+    # Shared prefill (one forward over [prompt | data]) — used by both the
+    # arithmetic-coding path (compress_batch) and the score-only path
+    # (score_batch), so the bits the latter reports match what the former emits.
     # ------------------------------------------------------------------
 
-    def compress_batch(
+    def _prefill(
         self,
-        input_ids: torch.Tensor,       # [B, max_seq_len]  — right-padded data tokens
-        attention_mask: torch.Tensor,  # [B, max_seq_len]  — used to read per-seq lengths
-        prompt_ctx: Optional[PromptContext] = None,
-    ) -> List[CompressedData]:
-        """Compress B sequences in a single model forward pass.
+        input_ids: torch.Tensor,                  # [B, max_data_len]  right-padded data
+        prompt_ctx: Optional[PromptContext],
+    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        """Single forward over ``[prompt | data]``.
 
-        Each sequence gets its own CompressedData.  The model is called once on
-        the full right-padded batch; per-sequence logits are extracted afterwards.
+        Returns ``(full_ids, logits, prefix_length)`` where ``full_ids`` is the
+        token tensor handed to the coder (the context portion is dummy zeros in
+        ``embeds`` mode) and ``logits[b, j]`` already predicts ``full_ids[b, j+1]``
+        (i.e. it is sliced to ``[:, :-1, :]``).
 
         No attention mask is passed to the model so the forward pass mirrors the
         decode loop (which also runs without a mask, relying on causal attention).
-        Causal attention ensures logits[b, j, :] depends only on
-        input_ids[b, 0:j+1], making right-padding safe.
+        Causal attention ensures ``logits[b, j, :]`` depends only on
+        ``full_ids[b, 0:j+1]``, making right-padding safe. In ``tokens`` mode
+        ``prompt_ctx.token_ids`` may be ``[1, P]`` (shared prompt) or ``[B, P]``
+        (a different prompt per row).
         """
         B = input_ids.shape[0]
         input_ids = input_ids.to(self.device)
-        seq_lens: List[int] = attention_mask.sum(dim=1).long().tolist()
 
         if prompt_ctx is None:
             prefix = torch.full((B, 1), self._dummy_token(), dtype=torch.long, device=self.device)
@@ -94,8 +99,29 @@ class LLMCompressor(BaseCompressor):
         else:
             raise ValueError(f"Unknown prompt mode: {prompt_ctx.mode!r}")
 
+        return full_ids, logits, prefix_length
+
+    # ------------------------------------------------------------------
+    # Batch API  (bs=1 is the degenerate case — pass a [1, L] tensor)
+    # ------------------------------------------------------------------
+
+    def compress_batch(
+        self,
+        input_ids: torch.Tensor,       # [B, max_seq_len]  — right-padded data tokens
+        attention_mask: torch.Tensor,  # [B, max_seq_len]  — used to read per-seq lengths
+        prompt_ctx: Optional[PromptContext] = None,
+    ) -> List[CompressedData]:
+        """Compress B sequences in a single model forward pass.
+
+        Each sequence gets its own CompressedData.  The model is called once on
+        the full right-padded batch (via :meth:`_prefill`); per-sequence logits
+        are extracted afterwards.
+        """
+        seq_lens: List[int] = attention_mask.sum(dim=1).long().tolist()
+        full_ids, logits, prefix_length = self._prefill(input_ids, prompt_ctx)
+
         results: List[CompressedData] = []
-        for b in range(B):
+        for b in range(input_ids.shape[0]):
             L = int(seq_lens[b])
             seq_ids    = full_ids[b:b+1, :prefix_length + L]
             seq_logits = logits[b:b+1, :prefix_length + L - 1, :]
@@ -103,6 +129,32 @@ class LLMCompressor(BaseCompressor):
             cd.metadata["prefix_length"] = prefix_length
             cd.metadata["prompt_mode"] = prompt_ctx.mode if prompt_ctx else "none"
             results.append(cd)
+        return results
+
+    def score_batch(
+        self,
+        input_ids: torch.Tensor,       # [B, max_seq_len]  — right-padded data tokens
+        attention_mask: torch.Tensor,  # [B, max_seq_len]  — used to read per-seq lengths
+        prompt_ctx: Optional[PromptContext] = None,
+    ) -> List[LMScore]:
+        """Code length (bits) + per-token NLL for each sequence — no coding.
+
+        The score-only counterpart of :meth:`compress_batch`: it shares
+        :meth:`_prefill`, so each ``LMScore.bits`` equals the data code length the
+        coder would emit (up to the few bytes of range-coder overhead). Use it to
+        *rank* prompt contexts by exact code length (RAC's oracle) and to inspect
+        per-token surprise (RAC's cascade) without paying for the range coder.
+        """
+        seq_lens: List[int] = attention_mask.sum(dim=1).long().tolist()
+        full_ids, logits, prefix_length = self._prefill(input_ids, prompt_ctx)
+
+        results: List[LMScore] = []
+        for b in range(input_ids.shape[0]):
+            L = int(seq_lens[b])
+            target = full_ids[b, prefix_length: prefix_length + L]               # [L]
+            lg = logits[b, prefix_length - 1: prefix_length - 1 + L, :]          # [L, V]
+            nll = -lg.log_softmax(dim=-1).gather(1, target.unsqueeze(1)).squeeze(1)
+            results.append(LMScore(bits=float(nll.sum().item()) / math.log(2), token_nll=nll))
         return results
 
     def decompress_batch(
