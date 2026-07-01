@@ -126,6 +126,7 @@ def _rac_worker(
         cascade_min_frac=cfg["cascade_min_frac"],
         cascade_top_k=cfg["cascade_top_k"],
         retriever=retriever if cfg["cascade_retriever"] else None,
+        chunk_size=cfg["chunk_size"],
         device=device,
     )
 
@@ -281,6 +282,7 @@ def _calibrate(device, model_path, texts, calib_idx, database_dir, signals, embe
         cascade_min_frac=cfg["cascade_min_frac"],
         cascade_top_k=cfg["cascade_top_k"],
         retriever=retriever if cfg["cascade_retriever"] else None,
+        chunk_size=cfg["chunk_size"],
         device=device,
     )
 
@@ -335,8 +337,9 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="top-k candidates tried per window")
     p.add_argument("--max-tokens", type=int, default=None,
                    help="data piece size (default: LM ctx - max-ctx)")
-    p.add_argument("--max-ctx", type=int, default=1024,
-                   help="total prefix-token budget")
+    p.add_argument("--max-ctx", type=int, default=None,
+                   help="total prefix-token budget "
+                        "(default: chunk_size * max conditions)")
     p.add_argument("--margin-bits", type=float, default=0.0)
     p.add_argument("--batch-size", type=int, default=None,
                    help="candidates scored per LM forward (default: auto-probe)")
@@ -368,8 +371,16 @@ def main() -> None:
     with open(os.path.join(args.database, "meta.json")) as f:
         meta = json.load(f)
 
+    # Prefix budget = one full retrieval unit per condition. Deriving it from the
+    # database chunk_size keeps max_ctx == chunk_size * max_cond, so no condition
+    # is ever truncated (see RACCompressor); an explicit --max-ctx is validated
+    # by the same invariant.
+    chunk_size = meta["chunk_size"]
+    max_cond = args.cascade_max_cond if args.cascade else 1
+    max_ctx = args.max_ctx if args.max_ctx is not None else chunk_size * max_cond
+
     ctx_len = AutoConfig.from_pretrained(args.model).max_position_embeddings
-    max_tokens = args.max_tokens or (ctx_len - args.max_ctx)
+    max_tokens = args.max_tokens or (ctx_len - max_ctx)
 
     eval_path = args.dataset or os.path.join(args.database, "eval_docs.jsonl")
     n_calib = args.calib_docs if args.calibrate else 0
@@ -392,7 +403,8 @@ def main() -> None:
           f"data piece {max_tokens} tok | m {args.m} | devices: {devices}")
 
     cfg = dict(
-        max_ctx=args.max_ctx,
+        max_ctx=max_ctx,
+        chunk_size=chunk_size,
         margin_bits=args.margin_bits,
         batch_size=args.batch_size,
         cascade=args.cascade,

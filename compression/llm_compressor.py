@@ -1,13 +1,11 @@
 """LLMCompressor: token-level compression using a causal language model.
 
-Supports two prompt context modes (see PromptContext):
-  tokens — retrieved or hand-crafted token IDs prepended before the data.
-  embeds — pre-computed latent embeddings injected before data embeddings;
-            model is called with inputs_embeds so no token IDs are needed
-            for the context portion.
+An optional PromptContext (mode "tokens") prepends retrieved or hand-crafted
+token IDs before the data; the coder skips those prefix positions. With no
+PromptContext the data is coded after a single dummy BOS token.
 
 Compress path (prefill):
-  1. Build full input [prompt | data] (tokens or embeds).
+  1. Build full input [prompt | data].
   2. Single forward pass → logits for every position.
   3. Arithmetic-code only the data portion (skip prefix_length positions).
 
@@ -57,9 +55,8 @@ class LLMCompressor(BaseCompressor):
         """Single forward over ``[prompt | data]``.
 
         Returns ``(full_ids, logits, prefix_length)`` where ``full_ids`` is the
-        token tensor handed to the coder (the context portion is dummy zeros in
-        ``embeds`` mode) and ``logits[b, j]`` already predicts ``full_ids[b, j+1]``
-        (i.e. it is sliced to ``[:, :-1, :]``).
+        token tensor handed to the coder and ``logits[b, j]`` already predicts
+        ``full_ids[b, j+1]`` (i.e. it is sliced to ``[:, :-1, :]``).
 
         No attention mask is passed to the model so the forward pass mirrors the
         decode loop (which also runs without a mask, relying on causal attention).
@@ -75,29 +72,17 @@ class LLMCompressor(BaseCompressor):
             prefix = torch.full((B, 1), self._dummy_token(), dtype=torch.long, device=self.device)
             prefix_length = 1
             full_ids = torch.cat([prefix, input_ids], dim=1)
-            with torch.inference_mode():
-                logits = self.model(full_ids, use_cache=False).logits[:, :-1, :].float()
 
         elif prompt_ctx.mode == "tokens":
             ctx_ids = prompt_ctx.token_ids.to(self.device).expand(B, -1)
             prefix_length = prompt_ctx.prefix_length()
             full_ids = torch.cat([ctx_ids, input_ids], dim=1)
-            with torch.inference_mode():
-                logits = self.model(full_ids, use_cache=False).logits[:, :-1, :].float()
-
-        elif prompt_ctx.mode == "embeds":
-            ctx_embeds = prompt_ctx.embeds.to(self.device).expand(B, -1, -1)
-            prefix_length = prompt_ctx.prefix_length()
-            with torch.inference_mode():
-                data_embeds = self.model.get_input_embeddings()(input_ids)
-                full_embeds = torch.cat([ctx_embeds, data_embeds], dim=1)
-                logits = self.model(inputs_embeds=full_embeds, use_cache=False).logits[:, :-1, :].float()
-            # Reconstruct token tensor for _encode_sequence (context portion is dummy zeros)
-            dummy_prefix = torch.zeros(B, prefix_length, dtype=torch.long, device=self.device)
-            full_ids = torch.cat([dummy_prefix, input_ids], dim=1)
 
         else:
             raise ValueError(f"Unknown prompt mode: {prompt_ctx.mode!r}")
+
+        with torch.inference_mode():
+            logits = self.model(full_ids, use_cache=False).logits[:, :-1, :].float()
 
         return full_ids, logits, prefix_length
 
@@ -179,17 +164,6 @@ class LLMCompressor(BaseCompressor):
             def get_logits_fn(buf: torch.Tensor) -> torch.Tensor:
                 with torch.inference_mode():
                     return self.model(buf, use_cache=False).logits[:, :-1, :].float()
-
-        elif prompt_ctx.mode == "embeds":
-            ctx_embeds = prompt_ctx.embeds.to(self.device).expand(B, -1, -1)
-            prefix_length = prompt_ctx.prefix_length()
-            start_tokens = torch.zeros(B, prefix_length, dtype=torch.long, device=self.device)
-            def get_logits_fn(buf: torch.Tensor) -> torch.Tensor:
-                data_ids = buf[:, prefix_length:]
-                with torch.inference_mode():
-                    data_embeds = self.model.get_input_embeddings()(data_ids)
-                    full_embeds = torch.cat([ctx_embeds, data_embeds], dim=1)
-                    return self.model(inputs_embeds=full_embeds, use_cache=False).logits[:, :-1, :].float()
 
         else:
             raise ValueError(f"Unknown prompt mode: {prompt_ctx.mode!r}")

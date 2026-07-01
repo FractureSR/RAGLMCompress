@@ -287,31 +287,3 @@ class Retriever:
             if len(out) >= top_k:
                 break
         return out
-
-
-
-def load_splits_from_cache(data_dir: str) -> Tuple[List[dict], List[dict], List[dict]]:
-    """Load base/train/test splits previously saved by prepare_rac_data.py."""
-    def _load(name):
-        path = os.path.join(data_dir, name)
-        if not os.path.exists(path):
-            raise FileNotFoundError(
-                f"Split cache not found: {path}\n"
-                "Run prepare_rac_data.py first with --out pointing to this directory."
-            )
-        with open(path) as f:
-            return json.load(f)
-    return _load("base_chunks.json"), _load("train_pieces.json"), _load("test_pieces.json")
-
-
-def load_retrieval_cache(data_dir: str, split: str) -> Dict[str, List[int]]:
-    """Load the precomputed ``{query_id: [base_id, ...]}`` cache for a split."""
-    path = os.path.join(data_dir, f"retrieval_{split}.json")
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"Retrieval cache not found: {path}\n"
-            "Run prepare_rac_data.py first with the same --dataset/split args "
-            "and --out pointing to this directory."
-        )
-    with open(path) as f:
-        return json.load(f)

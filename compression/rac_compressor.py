@@ -48,6 +48,7 @@ class RACCompressor:
         cascade_min_frac: float = 0.05,
         cascade_top_k: int = 16,
         retriever=None,
+        chunk_size: Optional[int] = None,
         device: Optional[torch.device] = None,
     ) -> None:
         self.llm = llm_compressor
@@ -66,6 +67,20 @@ class RACCompressor:
         self.cascade_top_k = cascade_top_k
         self.retriever = retriever
         self.pad_id = self.tokenizer.pad_token_id or 0
+        # At most this many conditions are ever prepended per piece (one per
+        # cascade level; exactly one when cascade is off).
+        self.max_cond = self.cascade_max_cond if self.cascade else 1
+        # The prefix budget must fit every condition at full size, otherwise
+        # ``_build_prefix`` would silently truncate later conditions to nothing
+        # (they'd yield zero gain and be rejected after a wasted forward pass).
+        if chunk_size is not None:
+            assert max_ctx == chunk_size * self.max_cond, (
+                f"max_ctx ({max_ctx}) must equal chunk_size ({chunk_size}) * "
+                f"max_cond ({self.max_cond}) = {chunk_size * self.max_cond} so "
+                f"every retrieved condition fits the prefix budget without "
+                f"truncation. Set --max-ctx accordingly (or lower "
+                f"--cascade-max-cond / --chunk-size)."
+            )
 
     def compress_batch(
         self,
@@ -87,11 +102,10 @@ class RACCompressor:
             p.nll = score.token_nll
 
         active = [p for p in pieces if p.pool]
-        max_cond = self.cascade_max_cond if self.cascade else 1
-        for level in range(max_cond):
+        for level in range(self.max_cond):
             if not active:
                 break
-            active = self._oracle_step(active, level, max_cond)
+            active = self._oracle_step(active, level, self.max_cond)
 
         return self._encode_pieces(pieces)
 
@@ -126,9 +140,6 @@ class RACCompressor:
                     out[i] = rec
 
         return self._filled(out)
-
-    def index_overhead_bits(self, cd: CompressedData) -> float:
-        return float(cd.metadata.get("index_bits", 0.0))
 
     def _build_prefix(self, choices: Sequence[int]) -> List[int]:
         prefix: List[int] = []
