@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Build the RAC retrieval database (base corpus + index). No training, no test
-# pieces, no precomputed retrieval — eval_rac.py chunks + retrieves the held-out
+# pieces, no precomputed retrieval — eval_rac_llm.py chunks + retrieves the held-out
 # eval docs live.
 set -euo pipefail
 
-python utils/prepare_rac_data.py \
+python utils/prepare_rac_data_llm.py \
     --dataset datasets/codeparrot_github_code/C.jsonl \
     --n-docs 4000 \
     --base-frac 0.5 \

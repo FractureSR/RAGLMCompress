@@ -1,4 +1,4 @@
-python evaluation/eval_rac.py \
+python evaluation/eval_rac_llm.py \
     --database results/rac_c_db \
     --model pretrained/SmolLM2-135M \
     --m 16 \

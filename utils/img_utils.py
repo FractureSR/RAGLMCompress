@@ -16,6 +16,7 @@ from __future__ import annotations
 import glob as _glob
 import io
 import os
+import pickle
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -85,9 +86,26 @@ def _load_image_dir(
     return files[:n] if n is not None else files
 
 
+def load_rac_eval_samples(path: str, n: Optional[int] = None) -> List[str]:
+    """Load eval_samples.pkl emitted by prepare_rac_data_bgpt."""
+    pkl_path = path
+    if os.path.isdir(path):
+        pkl_path = os.path.join(path, "eval_samples.pkl")
+    if not os.path.isfile(pkl_path):
+        raise FileNotFoundError(f"RAC eval pickle not found: {pkl_path}")
+    with open(pkl_path, "rb") as f:
+        samples = pickle.load(f)
+    return samples[:n] if n is not None else samples
+
+
 # ---------------------------------------------------------------------------
 # Built-in dataset loaders
 # ---------------------------------------------------------------------------
+
+@register_image_loader("eval_samples.pkl")
+def _load_rac_eval_samples(path: str, n: Optional[int] = None) -> List[str]:
+    return load_rac_eval_samples(path, n)
+
 
 @register_image_loader("clic2024")
 def _load_clic2024(path: str, n: Optional[int] = None) -> List[str]:

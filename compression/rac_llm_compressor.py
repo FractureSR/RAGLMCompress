@@ -1,4 +1,11 @@
-"""Oracle retrieval-augmented compression over token prefixes."""
+"""Oracle retrieval-augmented compression over token prefixes (LLM).
+
+The text/LM instantiation of oracle RAC: it is to ``LLMCompressor`` what
+``RACBGPTCompressor`` is to ``BGPTCompressor``
+(``RACLLMCompressor`` : ``LLMCompressor`` :: ``RACBGPTCompressor`` :
+``BGPTCompressor``). Conditions are the raw token ids of retrieved base chunks,
+prepended through ``LLMCompressor``'s ``PromptContext``.
+"""
 from __future__ import annotations
 
 from collections import defaultdict
@@ -31,7 +38,7 @@ class _Piece:
     nll: Optional[torch.Tensor] = None
 
 
-class RACCompressor:
+class RACLLMCompressor:
     """Select retrieved token prefixes by exact LM code length, then encode."""
 
     def __init__(
@@ -49,12 +56,14 @@ class RACCompressor:
         cascade_top_k: int = 16,
         retriever=None,
         chunk_size: Optional[int] = None,
+        show_progress: bool = False,
         device: Optional[torch.device] = None,
     ) -> None:
         self.llm = llm_compressor
         self.model = llm_compressor.model
         self.tokenizer = llm_compressor.tokenizer
         self.device = device or llm_compressor.device
+        self.show_progress = show_progress
         self.base_tokens = base_tokens
         self.index_coder = index_coder or FixedIndexCoder(len(base_tokens))
         self.max_ctx = max_ctx
@@ -82,6 +91,17 @@ class RACCompressor:
                 f"--cascade-max-cond / --chunk-size)."
             )
 
+    def _pbar(self, total: int, desc: str):
+        """A per-device tqdm over model-forward sequences, or None if disabled."""
+        if not self.show_progress:
+            return None
+        import tqdm as _tqdm
+        return _tqdm.tqdm(
+            total=total, desc=f"{desc} [{self.device}]",
+            position=getattr(self.device, "index", 0) or 0,
+            leave=False, unit="seq", unit_scale=True,
+        )
+
     def compress_batch(
         self,
         data_token_lists: List[List[int]],
@@ -95,19 +115,29 @@ class RACCompressor:
             for i, (data, cands) in enumerate(zip(data_token_lists, cand_ids_lists))
         ]
 
-        baseline = self._score_jobs([[]] * len(pieces), [p.data for p in pieces])
-        for p, score in zip(pieces, baseline):
-            p.baseline_bits = score.bits
-            p.bits = score.bits
-            p.nll = score.token_nll
+        # Sequences fed to the model: baseline (1/piece) + level-0 candidates
+        # (pool size/piece) + encode (1/piece). Cascade grows the total live.
+        n_pieces = len(pieces)
+        pbar = self._pbar(2 * n_pieces + sum(len(p.pool) for p in pieces),
+                          "RAC compress")
+        try:
+            baseline = self._score_jobs([[]] * n_pieces, [p.data for p in pieces],
+                                        pbar=pbar)
+            for p, score in zip(pieces, baseline):
+                p.baseline_bits = score.bits
+                p.bits = score.bits
+                p.nll = score.token_nll
 
-        active = [p for p in pieces if p.pool]
-        for level in range(self.max_cond):
-            if not active:
-                break
-            active = self._oracle_step(active, level, self.max_cond)
+            active = [p for p in pieces if p.pool]
+            for level in range(self.max_cond):
+                if not active:
+                    break
+                active = self._oracle_step(active, level, self.max_cond, pbar=pbar)
 
-        return self._encode_pieces(pieces)
+            return self._encode_pieces(pieces, pbar=pbar)
+        finally:
+            if pbar is not None:
+                pbar.close()
 
     def decompress_batch(
         self,
@@ -122,22 +152,29 @@ class RACCompressor:
             prefix = self._build_prefix(cd.metadata.get("ctx_ids", []))
             by_plen[len(prefix)].append((i, cd, prefix))
 
-        for plen, group in by_plen.items():
-            for start in range(0, len(group), self.batch_size):
-                batch = group[start:start + self.batch_size]
-                cds = [cd for _, cd, _ in batch]
-                if plen == 0:
-                    recs = self.llm.decompress_batch(cds)
-                else:
-                    prompt = PromptContext(
-                        mode="tokens",
-                        token_ids=torch.tensor(
-                            [prefix for _, _, prefix in batch], dtype=torch.long,
-                        ),
-                    )
-                    recs = self.llm.decompress_batch(cds, prompt)
-                for (i, _, _), rec in zip(batch, recs):
-                    out[i] = rec
+        pbar = self._pbar(len(compressed_list), "RAC decompress")
+        try:
+            for plen, group in by_plen.items():
+                for start in range(0, len(group), self.batch_size):
+                    batch = group[start:start + self.batch_size]
+                    cds = [cd for _, cd, _ in batch]
+                    if plen == 0:
+                        recs = self.llm.decompress_batch(cds)
+                    else:
+                        prompt = PromptContext(
+                            mode="tokens",
+                            token_ids=torch.tensor(
+                                [prefix for _, _, prefix in batch], dtype=torch.long,
+                            ),
+                        )
+                        recs = self.llm.decompress_batch(cds, prompt)
+                    for (i, _, _), rec in zip(batch, recs):
+                        out[i] = rec
+                    if pbar is not None:
+                        pbar.update(len(batch))
+        finally:
+            if pbar is not None:
+                pbar.close()
 
         return self._filled(out)
 
@@ -158,6 +195,7 @@ class RACCompressor:
         self,
         prefixes: List[List[int]],
         datas: List[List[int]],
+        pbar=None,
     ) -> List[LMScore]:
         out: List[Optional[LMScore]] = [None] * len(prefixes)
         by_plen: Dict[int, List[int]] = defaultdict(list)
@@ -184,6 +222,8 @@ class RACCompressor:
                     scores = self.llm.score_batch(input_ids, attn_mask, prompt)
                 for i, score in zip(batch, scores):
                     out[i] = score
+                if pbar is not None:
+                    pbar.update(len(batch))
 
         return self._filled(out)
 
@@ -192,6 +232,7 @@ class RACCompressor:
         active: List[_Piece],
         level: int,
         max_cond: int,
+        pbar=None,
     ) -> List[_Piece]:
         prefixes: List[List[int]] = []
         datas: List[List[int]] = []
@@ -200,7 +241,7 @@ class RACCompressor:
                 prefixes.append(self._build_prefix(p.choices + [cid]))
                 datas.append(p.data)
 
-        scores = self._score_jobs(prefixes, datas)
+        scores = self._score_jobs(prefixes, datas, pbar=pbar)
 
         next_active: List[_Piece] = []
         retrieve_pieces: List[_Piece] = []
@@ -235,6 +276,8 @@ class RACCompressor:
                 if self.retriever is None or not query:
                     if p.pool:
                         next_active.append(p)
+                        if pbar is not None:
+                            pbar.total += len(p.pool)
                 else:
                     retrieve_pieces.append(p)
                     retrieve_queries.append(query)
@@ -250,6 +293,8 @@ class RACCompressor:
                 p.pool = [cid for cid, _ in hits if cid not in p.used]
                 if p.pool:
                     next_active.append(p)
+                    if pbar is not None:
+                        pbar.total += len(p.pool)
 
         return next_active
 
@@ -268,7 +313,7 @@ class RACCompressor:
         query = self.tokenizer.decode(hi_tokens, skip_special_tokens=True)
         return query if query.strip() else ""
 
-    def _encode_pieces(self, pieces: List[_Piece]) -> List[CompressedData]:
+    def _encode_pieces(self, pieces: List[_Piece], pbar=None) -> List[CompressedData]:
         out: List[Optional[CompressedData]] = [None] * len(pieces)
         by_plen: Dict[int, List[_Piece]] = defaultdict(list)
         for p in pieces:
@@ -302,6 +347,8 @@ class RACCompressor:
                     cd.metadata["baseline_bits"] = p.baseline_bits
                     cd.metadata["data_bits"] = p.bits
                     out[p.idx] = cd
+                if pbar is not None:
+                    pbar.update(len(batch))
 
         return self._filled(out)
 

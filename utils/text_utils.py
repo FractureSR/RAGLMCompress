@@ -43,9 +43,11 @@ def extract_document_text(record: Any, text_keys: Sequence[str] = ("text", "cont
         if value is not None:
             concated_value += str(value)
         else:
-            raise KeyError(
+            warnings.warn(
                 f"No text field {key!r} found, "
-                f"available: {list(record.keys())}"
+                f"available: {list(record.keys())}",
+                RuntimeWarning,
+                stacklevel=2,
             )
     return concated_value
 
@@ -197,7 +199,7 @@ def _load_codeparrot_github_code_Python(path: str, n: Optional[int] = None, skip
 
 @register_text_loader("eval_docs.jsonl")
 def _load_rac_eval_docs(path: str, n: Optional[int] = None, skip: int = 0) -> List[str]:
-    """Held-out eval docs persisted by prepare_rac_data.py (one {"text": ...} per line)."""
+    """Held-out eval docs persisted by prepare_rac_data_llm.py (one {"text": ...} per line)."""
     return _load_jsonl(path, ("text",), n, skip)
 
 # ---------------------------------------------------------------------------

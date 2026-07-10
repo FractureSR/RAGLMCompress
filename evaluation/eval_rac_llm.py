@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 import argparse
+import gc
 import json
 import os
 import sys
@@ -16,7 +17,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from compression.llm_compressor import LLMCompressor
-from compression.rac_compressor import RACCompressor
+from compression.rac_llm_compressor import RACLLMCompressor
 from compression.rac_index import CalibratedIndexCoder, FixedIndexCoder, load_index_coder
 from utils.eval_utils import (
     EvalResult, EvalStats,
@@ -114,7 +115,7 @@ def _rac_worker(
     base_tokens, retriever = _load_database(database_dir, signals, embed_model, device)
 
     index_coder = load_index_coder(index_path) if index_path else FixedIndexCoder(len(base_tokens))
-    rac = RACCompressor(
+    rac = RACLLMCompressor(
         llm, base_tokens,
         index_coder=index_coder,
         max_ctx=cfg["max_ctx"],
@@ -127,6 +128,7 @@ def _rac_worker(
         cascade_top_k=cfg["cascade_top_k"],
         retriever=retriever if cfg["cascade_retriever"] else None,
         chunk_size=cfg["chunk_size"],
+        show_progress=True,
         device=device,
     )
 
@@ -154,7 +156,9 @@ def _rac_worker(
     def _probe(batch_size: int, seq_len: int) -> None:
         dummy = torch.zeros(batch_size, seq_len, dtype=torch.long, device=device)
         with torch.inference_mode():
-            model(dummy, use_cache=False)
+            logits = model(dummy, use_cache=False).logits[:, :-1, :].float()
+            _ = logits.log_softmax(dim=-1)
+        del logits
         del dummy
 
     score_lens = [n + cfg["max_ctx"] for n in chunk_lens[:200]]
@@ -268,55 +272,97 @@ def _rac_worker(
 
 def _calibrate(device, model_path, texts, calib_idx, database_dir, signals, embed_model,
                m, max_tokens, cfg, alpha, save_path):
-    model, tokenizer = _load_model(model_path, device)
-    llm = LLMCompressor(model, tokenizer, device=device)
-    base_tokens, retriever = _load_database(database_dir, signals, embed_model, device)
-    rac = RACCompressor(
-        llm, base_tokens,
-        max_ctx=cfg["max_ctx"],
-        margin_bits=cfg["margin_bits"],
-        batch_size=cfg["batch_size"] or 1,
-        cascade=cfg["cascade"],
-        cascade_max_cond=cfg["cascade_max_cond"],
-        cascade_nll_thresh=cfg["cascade_nll_thresh"],
-        cascade_min_frac=cfg["cascade_min_frac"],
-        cascade_top_k=cfg["cascade_top_k"],
-        retriever=retriever if cfg["cascade_retriever"] else None,
-        chunk_size=cfg["chunk_size"],
-        device=device,
-    )
-
-    worker_texts = [texts[i] for i in calib_idx]
-    chunks = [
-        c for c in chunk_documents_for_compression(
-            worker_texts, tokenizer, max_tokens, decode=True,
+    model = tokenizer = llm = base_tokens = retriever = rac = None
+    chunks = datas = queries = cand_lists = cds = None
+    try:
+        model, tokenizer = _load_model(model_path, device)
+        llm = LLMCompressor(model, tokenizer, device=device)
+        base_tokens, retriever = _load_database(database_dir, signals, embed_model, device)
+        rac = RACLLMCompressor(
+            llm, base_tokens,
+            max_ctx=cfg["max_ctx"],
+            margin_bits=cfg["margin_bits"],
+            batch_size=cfg["batch_size"] or 1,
+            cascade=cfg["cascade"],
+            cascade_max_cond=cfg["cascade_max_cond"],
+            cascade_nll_thresh=cfg["cascade_nll_thresh"],
+            cascade_min_frac=cfg["cascade_min_frac"],
+            cascade_top_k=cfg["cascade_top_k"],
+            retriever=retriever if cfg["cascade_retriever"] else None,
+            chunk_size=cfg["chunk_size"],
+            show_progress=True,
+            device=device,
         )
-        if c.token_ids
-    ]
-    datas = [c.token_ids for c in chunks]
-    queries = [c.text for c in chunks]
-    cand_lists = (
-        [[cid for cid, _ in hits]
-         for hits in retriever.retrieve_many(queries, top_k=m)]
-        if queries else []
-    )
 
-    def _probe(batch_size: int, seq_len: int) -> None:
-        dummy = torch.zeros(batch_size, seq_len, dtype=torch.long, device=device)
-        with torch.inference_mode():
-            model(dummy, use_cache=False)
-        del dummy
+        worker_texts = [texts[i] for i in calib_idx]
+        chunks = [
+            c for c in chunk_documents_for_compression(
+                worker_texts, tokenizer, max_tokens, decode=True,
+            )
+            if c.token_ids
+        ]
+        datas = [c.token_ids for c in chunks]
+        queries = [c.text for c in chunks]
+        cand_lists = (
+            [[cid for cid, _ in hits]
+             for hits in retriever.retrieve_many(queries, top_k=m)]
+            if queries else []
+        )
 
-    score_lens = [len(d) + cfg["max_ctx"] for d in datas[:200]]
-    rac.batch_size = cfg["batch_size"] or auto_batch_size(
-        _probe, device, score_lens, max_batch=256,
-        n_samples=max(1, len(datas) * m), verbose=False,
-    )
-    cds = rac.compress_batch(datas, cand_lists)
-    seqs = [list(cd.metadata["ctx_ids"]) for cd in cds]
-    CalibratedIndexCoder.calibrate(seqs, len(base_tokens), alpha=alpha).save(save_path)
-    print(f"  calibrated index on {len(seqs)} chunks "
-          f"(n_base={len(base_tokens)}) -> {save_path}")
+        def _probe(batch_size: int, seq_len: int) -> None:
+            dummy = torch.zeros(batch_size, seq_len, dtype=torch.long, device=device)
+            with torch.inference_mode():
+                logits = model(dummy, use_cache=False).logits[:, :-1, :].float()
+                _ = logits.log_softmax(dim=-1)
+            del logits
+            del dummy
+
+        score_lens = [len(d) + cfg["max_ctx"] for d in datas[:200]]
+        rac.batch_size = cfg["batch_size"] or auto_batch_size(
+            _probe, device, score_lens, max_batch=256,
+            n_samples=max(1, len(datas) * m), verbose=False,
+        )
+        effective_score_bs = rac.batch_size
+        while True:
+            try:
+                rac.batch_size = effective_score_bs
+                cds = rac.compress_batch(datas, cand_lists)
+                break
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                if effective_score_bs == 1:
+                    raise
+                effective_score_bs = max(1, effective_score_bs // 2)
+                print(f"\n  calibration OOM -- retrying with score_batch_size={effective_score_bs}")
+        seqs = [list(cd.metadata["ctx_ids"]) for cd in cds]
+        CalibratedIndexCoder.calibrate(seqs, len(base_tokens), alpha=alpha).save(save_path)
+        print(f"  calibrated index on {len(seqs)} chunks "
+              f"(n_base={len(base_tokens)}) -> {save_path}")
+    finally:
+        del cds, cand_lists, queries, datas, chunks
+        del rac, retriever, base_tokens, llm, model, tokenizer
+        gc.collect()
+        if torch.cuda.is_available() and device.type == "cuda":
+            with torch.cuda.device(device):
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats(device)
+
+
+def _calibrate_mp_worker(rank, args):
+    del rank
+    _calibrate(*args)
+
+
+def _calibrate_isolated(*args):
+    device = args[0]
+    if device.type != "cuda":
+        _calibrate(*args)
+        return
+
+    # Run calibration in a short-lived process so its CUDA context and allocator
+    # state disappear before the multi-GPU evaluation workers load their models.
+    import torch.multiprocessing as mp
+    mp.spawn(_calibrate_mp_worker, args=(args,), nprocs=1, join=True)
 
 
 # ---------------------------------------------------------------------------
@@ -373,7 +419,7 @@ def main() -> None:
 
     # Prefix budget = one full retrieval unit per condition. Deriving it from the
     # database chunk_size keeps max_ctx == chunk_size * max_cond, so no condition
-    # is ever truncated (see RACCompressor); an explicit --max-ctx is validated
+    # is ever truncated (see RACLLMCompressor); an explicit --max-ctx is validated
     # by the same invariant.
     chunk_size = meta["chunk_size"]
     max_cond = args.cascade_max_cond if args.cascade else 1
@@ -419,7 +465,7 @@ def main() -> None:
     if args.calibrate:
         index_path = args.save_index or os.path.join(tempfile.mkdtemp(), "index.json")
         print(f"Calibrating index coder on {len(calib_idx)} held-out docs ...")
-        _calibrate(
+        _calibrate_isolated(
             devices[0], args.model, texts, calib_idx, args.database, meta["signals"],
             args.embed_model, args.m, max_tokens, cfg, args.calib_alpha, index_path,
         )
@@ -438,7 +484,7 @@ def main() -> None:
             index_path=index_path,
             no_decomp=args.no_decompress,
         ),
-        tmp_prefix=os.path.join(args.tmp_dir, "_eval_rac"),
+        tmp_prefix=os.path.join(args.tmp_dir, "_eval_rac_llm"),
     )
 
     stats = EvalStats()

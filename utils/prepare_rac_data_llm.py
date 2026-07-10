@@ -3,7 +3,7 @@
 No training, no test/train pieces, no precomputed retrieval. We fix a slice of a
 dataset as the base corpus, chunk it into retrieval units (LM tokens, which double
 as the raw-token conditions prepended at compression), and index it.
-``eval_rac.py`` then chunks + retrieves the held-out eval docs *live*, exactly the
+``eval_rac_llm.py`` then chunks + retrieves the held-out eval docs *live*, exactly the
 way ``eval_llm.py`` chunks its input.
 
 Outputs under ``--out``:
@@ -15,7 +15,7 @@ Outputs under ``--out``:
 
 Example
 -------
-    python utils/prepare_rac_data.py \\
+    python utils/prepare_rac_data_llm.py \\
         --dataset datasets/codeparrot_github_code/C.jsonl --n-docs 4000 \\
         --base-frac 0.5 --chunk-size 512 --retriever bm25 \\
         --model pretrained/SmolLM2-135M --out results/rac_c_db
@@ -77,6 +77,7 @@ def main() -> None:
     chunks = chunk_documents_for_compression(
         base_docs, lm_tok, args.chunk_size, chunk_overlap=args.chunk_overlap,
         decode=True, align_last_window=True)
+    
     base = []
     for c in chunks:
         if not (c.text and c.text.strip() and c.token_ids):
@@ -88,6 +89,7 @@ def main() -> None:
         raise ValueError("No non-empty base chunks produced; increase --n-docs or --base-frac")
 
     os.makedirs(args.out, exist_ok=True)
+    
     with open(os.path.join(args.out, "base_chunks.json"), "w") as f:
         json.dump(base, f)
         

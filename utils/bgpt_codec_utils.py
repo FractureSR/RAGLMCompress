@@ -70,3 +70,50 @@ def pad_input_for_bgpt(
         "patches": torch.tensor(padded_bytes, dtype=torch.long, device=device),
         "masks": torch.tensor(patch_masks, dtype=torch.long, device=device),
     }
+
+
+# ---------------------------------------------------------------------------
+# Byte-domain retrieval (the bGPT instantiation of utils/rag_utils.py)
+# ---------------------------------------------------------------------------
+#
+# Mirrors the text instantiation in utils/text_utils.py (bm25_tokenize +
+# make_text_retriever): a modality supplies a tokenizer + a retriever factory
+# built from rag_utils' generic Scorer/Retriever. Here the "items" are raw byte
+# chunks (audio/image), so retrieval is syntactic over byte k-grams — the byte
+# analog of lexical text retrieval (RAC claim 2.1.1: re-encoding x favours
+# syntactic matches). Used by prepare_rac_data_bgpt.py (build) and
+# eval_rac_bgpt.py (load); pass the same signals/kgram to both since the
+# tokenizer callable is not persisted.
+
+def bgpt_bytes_tokenize(data, kgram: int = 4) -> List[str]:
+    """Tokenise a byte payload into overlapping k-gram words for BM25.
+
+    The byte-domain counterpart of ``text_utils.bm25_tokenize``: each sliding
+    window of ``kgram`` bytes becomes one hashable token (hex-encoded so ``bm25s``
+    sees plain strings), so chunks with locally similar byte sequences score high.
+    """
+    b = bytes(data)
+    if len(b) <= kgram:
+        return [b.hex()] if b else []
+    return [b[i:i + kgram].hex() for i in range(len(b) - kgram + 1)]
+
+
+def make_bgpt_retriever(signals: str = "bm25", kgram: int = 4, rrf_k: int = 60):
+    """Construct an *unbuilt* ``Retriever`` over byte chunks (its items are bytes).
+
+    ``signals``:
+      * ``"bm25"`` — lexical/syntactic over byte k-grams (default; no model
+        loaded, the RAC default — cf. ``text_utils.make_text_retriever``).
+
+    A dense byte scorer (e.g. bGPT's own patch encoder as the embedder) is the
+    natural ``"dense"``/``"hybrid"`` extension but is not implemented yet. The
+    same factory (same ``signals``/``kgram``) must be used to build and to load.
+    """
+    from functools import partial
+    from utils.rag_utils import Retriever, BM25Scorer
+    if signals != "bm25":
+        raise ValueError(
+            f"bgpt retriever supports signals='bm25' only (got {signals!r}); "
+            f"a dense byte/patch-embedding scorer is a future extension")
+    scorers = [BM25Scorer(tokenize=partial(bgpt_bytes_tokenize, kgram=kgram))]
+    return Retriever(scorers, rrf_k=rrf_k)

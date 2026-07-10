@@ -20,6 +20,7 @@ from __future__ import annotations
 import glob as _glob
 import io
 import os
+import pickle
 import wave
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence
@@ -92,9 +93,26 @@ def _load_audio_dir(
     return files[:n] if n is not None else files
 
 
+def load_rac_eval_samples(path: str, n: Optional[int] = None) -> List[Any]:
+    """Load eval_samples.pkl emitted by prepare_rac_data_bgpt."""
+    pkl_path = path
+    if os.path.isdir(path):
+        pkl_path = os.path.join(path, "eval_samples.pkl")
+    if not os.path.isfile(pkl_path):
+        raise FileNotFoundError(f"RAC eval pickle not found: {pkl_path}")
+    with open(pkl_path, "rb") as f:
+        samples = pickle.load(f)
+    return samples[:n] if n is not None else samples
+
+
 # ---------------------------------------------------------------------------
 # Built-in dataset loaders
 # ---------------------------------------------------------------------------
+
+@register_audio_loader("eval_samples.pkl")
+def _load_rac_eval_samples(path: str, n: Optional[int] = None) -> List[Any]:
+    return load_rac_eval_samples(path, n)
+
 
 @register_audio_loader("peoples_speech")
 def _load_peoples_speech(path: str, n: Optional[int] = None) -> List[Any]:
