@@ -13,9 +13,10 @@ python utils/prepare_rac_data_bgpt.py \
     --retriever bm25 --kgram 4 --seed 42 \
     --out results/rac_img_db
 
-# Audio (peoples_speech) — smaller chunks keep prefix+payload within the context
+# Audio (preprocessed People's Speech WAVs) — smaller chunks keep prefix+payload
+# within the context. Run download_peoples_speech_microset.py first.
 # python utils/prepare_rac_data_bgpt.py \
-#     --dataset datasets/peoples_speech --modality audio \
+#     --dataset datasets/peoples_speech_microset_wav --modality audio \
 #     --n-samples 200 --base-frac 0.5 \
 #     --chunk-ms 250 --patch-size 16 \
 #     --retriever bm25 --kgram 4 --seed 42 \

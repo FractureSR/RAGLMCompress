@@ -86,12 +86,14 @@ def _load_database(database_dir: str, signals: str, kgram: int, patch_size: int)
 
 
 def _load_samples(modality: str, path: str, n: Optional[int]):
-    """Load eval samples through the modality's registered dataset loaders."""
+    """Load an image corpus, WAV directory, or persisted RAC eval samples."""
     if modality == "image":
         from utils.img_utils import load_image_files
         return load_image_files(path, n)
     elif modality == "audio":
-        from utils.audio_utils import load_audio_samples
+        from utils.audio_utils import load_audio_samples, load_rac_eval_samples
+        if os.path.basename(path) == "eval_samples.pkl":
+            return load_rac_eval_samples(path, n)
         return load_audio_samples(path, n)
     raise ValueError(f"unsupported modality: {modality!r}")
 
@@ -400,7 +402,8 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="prepare_rac_data_bgpt --out dir (base_chunks + eval_samples + retriever + meta)")
     p.add_argument("--model", required=True, help="bGPT checkpoint (.pth)")
     p.add_argument("--dataset", default=None,
-                   help="eval corpus override (default: the database's eval_samples.pkl)")
+                   help=("eval corpus override: image dataset path or preprocessed "
+                         "WAV directory (default: database eval_samples.pkl)"))
     p.add_argument("--n-samples", type=int, default=None,
                    help="cap on eval samples (default: all held-out samples)")
     p.add_argument("--m", type=int, default=16, help="top-k candidates tried per unit")

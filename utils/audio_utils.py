@@ -1,19 +1,7 @@
-"""Audio preprocessing for compression.
+"""Load and chunk preprocessed bGPT audio.
 
-Dataset loaders are registered by name; ``load_audio_samples`` auto-detects
-the dataset from the path and dispatches to the matching loader.
-
-Loaders return a flat list of audio payloads — anything accepted by
-``audio_to_pydub_seg``: a file path, encoded bytes (FLAC/WAV/OGG/...),
-an HF-style audio dict, or a pydub AudioSegment.
-
-Adding a new dataset
---------------------
-    from utils.audio_utils import register_audio_loader
-
-    @register_audio_loader("my_dataset")
-    def _load_my_dataset(path: str, n: Optional[int] = None) -> List[Any]:
-        ...  # return list of audio payloads (paths, bytes, ...)
+All input clips must be uncompressed 8 kHz, mono, 8-bit PCM WAV files. Dataset
+download scripts own decoding, resampling, channel conversion, and WAV export.
 """
 from __future__ import annotations
 
@@ -23,112 +11,73 @@ import os
 import pickle
 import wave
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence
-
-import numpy as np
+from typing import List, Optional, Sequence
 
 
-# ---------------------------------------------------------------------------
-# Loader registry
-# ---------------------------------------------------------------------------
-
-AudioLoader = Callable[[str, Optional[int]], List[Any]]
-
-_AUDIO_LOADERS: Dict[str, AudioLoader] = {}
+SAMPLE_RATE = 8000
+CHANNELS = 1
+SAMPLE_WIDTH = 1
 
 
-def register_audio_loader(name: str):
-    """Decorator to register an audio dataset loader by name.
-
-    Detection: *name* (hyphens normalised to underscores) must appear as a
-    substring of the normalised dataset path.
-    """
-    def decorator(fn: AudioLoader) -> AudioLoader:
-        _AUDIO_LOADERS[name] = fn
-        return fn
-    return decorator
-
-
-def _find_audio_loader(path: str) -> AudioLoader:
-    key = os.path.basename(os.path.normpath(path)).lower().replace("-", "_")
-    for name, loader in _AUDIO_LOADERS.items():
-        if name.replace("-", "_") in key:
-            return loader
-    raise ValueError(
-        f"No audio loader registered for {path!r}.\n"
-        f"Known datasets: {sorted(_AUDIO_LOADERS)}.\n"
-        f"Register a new one with @register_audio_loader('name')."
-    )
-
-
-def load_audio_samples(path: str, n: Optional[int] = None) -> List[Any]:
-    """Dispatch to the registered loader for the audio dataset at *path*."""
-    return _find_audio_loader(path)(path, n)
-
-
-# Backward-compat alias
-load_audio_rows = load_audio_samples
-
-
-# ---------------------------------------------------------------------------
-# Shared low-level helpers used by built-in loaders
-# ---------------------------------------------------------------------------
-
-def _load_audio_dir(
-    path: str,
-    n: Optional[int],
-    extensions: Sequence[str] = (".wav", ".flac", ".ogg", ".mp3"),
-) -> List[str]:
+def load_audio_samples(path: str, n: Optional[int] = None) -> List[bytes]:
+    """Read preprocessed WAV files from a directory in filename order."""
     if not os.path.isdir(path):
         raise FileNotFoundError(f"Audio dataset directory not found: {path}")
-    files: List[str] = []
-    for ext in extensions:
-        files.extend(_glob.glob(os.path.join(path, f"*{ext}")))
-        files.extend(_glob.glob(os.path.join(path, f"*{ext.upper()}")))
-    files = sorted(set(files))
+
+    files = sorted(set(
+        _glob.glob(os.path.join(path, "*.wav"))
+        + _glob.glob(os.path.join(path, "*.WAV"))
+    ))
     if not files:
-        raise FileNotFoundError(
-            f"No audio files ({', '.join(extensions)}) found in {path}"
-        )
-    return files[:n] if n is not None else files
+        raise FileNotFoundError(f"No WAV files found in {path}")
+
+    selected = files[:n] if n is not None else files
+    samples: List[bytes] = []
+    for file_path in selected:
+        with open(file_path, "rb") as f:
+            data = f.read()
+        _validate_wav(data, file_path)
+        samples.append(data)
+    return samples
 
 
-def load_rac_eval_samples(path: str, n: Optional[int] = None) -> List[Any]:
-    """Load eval_samples.pkl emitted by prepare_rac_data_bgpt."""
-    pkl_path = path
-    if os.path.isdir(path):
-        pkl_path = os.path.join(path, "eval_samples.pkl")
-    if not os.path.isfile(pkl_path):
-        raise FileNotFoundError(f"RAC eval pickle not found: {pkl_path}")
-    with open(pkl_path, "rb") as f:
+def load_rac_eval_samples(path: str, n: Optional[int] = None) -> List[bytes]:
+    """Load preprocessed WAV bytes persisted by prepare_rac_data_bgpt."""
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"RAC eval pickle not found: {path}")
+    with open(path, "rb") as f:
         samples = pickle.load(f)
-    return samples[:n] if n is not None else samples
+    selected = samples[:n] if n is not None else samples
+    for sample_idx, sample in enumerate(selected):
+        if not isinstance(sample, bytes):
+            raise TypeError(
+                f"RAC eval sample {sample_idx} must be bytes, "
+                f"got {type(sample)!r}; rebuild the database"
+            )
+        _validate_wav(sample, f"{path}[{sample_idx}]")
+    return selected
 
 
-# ---------------------------------------------------------------------------
-# Built-in dataset loaders
-# ---------------------------------------------------------------------------
+def _validate_wav(data: bytes, source: str) -> None:
+    if not isinstance(data, bytes):
+        raise TypeError(f"Audio sample must be bytes, got {type(data)!r}")
+    try:
+        with wave.open(io.BytesIO(data), "rb") as wav_file:
+            actual = (
+                wav_file.getframerate(),
+                wav_file.getnchannels(),
+                wav_file.getsampwidth(),
+                wav_file.getcomptype(),
+            )
+    except (EOFError, wave.Error) as exc:
+        raise ValueError(f"Invalid WAV file: {source}") from exc
 
-@register_audio_loader("eval_samples.pkl")
-def _load_rac_eval_samples(path: str, n: Optional[int] = None) -> List[Any]:
-    return load_rac_eval_samples(path, n)
-
-
-@register_audio_loader("peoples_speech")
-def _load_peoples_speech(path: str, n: Optional[int] = None) -> List[Any]:
-    import pandas as pd
-    # Accept either a directory of parquets or a single parquet file.
-    df = pd.read_parquet(path)
-    if n is not None:
-        df = df.iloc[:n]
-    # The parquet schema nests the payload under "audio"; unwrap it here so
-    # downstream code sees plain audio payloads (dicts with "bytes"/"path").
-    return df["audio"].tolist()
-
-
-@register_audio_loader("hf_wav_u8_8k_trimmed")
-def _load_hf_wav_u8_8k_trimmed(path: str, n: Optional[int] = None) -> List[Any]:
-    return _load_audio_dir(path + "/audio", n, extensions=(".wav",))
+    expected = (SAMPLE_RATE, CHANNELS, SAMPLE_WIDTH, "NONE")
+    if actual != expected:
+        raise ValueError(
+            f"Expected 8 kHz mono 8-bit PCM WAV for {source}, "
+            f"got rate/channels/sample-width/compression={actual}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -139,8 +88,8 @@ def _load_hf_wav_u8_8k_trimmed(path: str, n: Optional[int] = None) -> List[Any]:
 class AudioChunkRecord:
     """A single audio chunk with provenance, produced by chunk_audio_for_compression.
 
-    Mirrors TextChunk in text_utils: data is the payload, sample_idx identifies
-    the source clip, chunk_idx is the position within the clip.
+    ``data`` contains raw unsigned 8-bit PCM frames without a WAV header.
+    ``sample_idx`` identifies the source clip and ``chunk_idx`` is its position.
     """
     data:       bytes
     sample_idx: int   # index into the worker's local sample list
@@ -148,26 +97,40 @@ class AudioChunkRecord:
 
 
 def chunk_audio_for_compression(
-    samples: List[Any],
+    samples: Sequence[bytes],
     indices: List[int],
     chunk_ms: int = 1000,
 ) -> List[AudioChunkRecord]:
     """Split all audio clips in a worker shard into a flat list of AudioChunkRecords.
 
-    Each sample is any payload accepted by audio_to_pydub_seg (file path,
-    encoded bytes, HF audio dict, AudioSegment).
-    Pure preprocessing step — no compression logic involved.
+    Each input is already an 8 kHz mono 8-bit PCM WAV. This function strips the
+    container and returns chunks containing only raw PCM frames.
     Mirrors chunk_documents_for_compression in text_utils.
     """
+    if chunk_ms <= 0:
+        raise ValueError(f"chunk_ms must be positive, got {chunk_ms}")
+    frames_per_chunk = SAMPLE_RATE * chunk_ms // 1000
+    if frames_per_chunk <= 0:
+        raise ValueError(f"chunk_ms={chunk_ms} produces an empty chunk")
+
     all_records: List[AudioChunkRecord] = []
     for local_idx, i in enumerate(indices):
-        seg = audio_to_pydub_seg(samples[i])
-        chunks = chunk_pydub_audio(seg, chunk_ms=chunk_ms)
-        if not chunks:
+        data = samples[i]
+        _validate_wav(data, f"sample {i}")
+        sample_chunks = 0
+        with wave.open(io.BytesIO(data), "rb") as wav_file:
+            while True:
+                frames = wav_file.readframes(frames_per_chunk)
+                if not frames:
+                    break
+                all_records.append(AudioChunkRecord(
+                    data=frames,
+                    sample_idx=local_idx,
+                    chunk_idx=sample_chunks,
+                ))
+                sample_chunks += 1
+        if sample_chunks == 0:
             raise ValueError(f"Audio sample {i} produced no chunks")
-        for chunk_idx, c in enumerate(chunks):
-            all_records.append(AudioChunkRecord(
-                data=c, sample_idx=local_idx, chunk_idx=chunk_idx))
     return all_records
 
 
@@ -175,78 +138,12 @@ def chunk_audio_for_compression(
 # bGPT audio format helpers (8 kHz / mono / 8-bit unsigned PCM)
 # ---------------------------------------------------------------------------
 
-def audio_to_pydub_seg(data: Any):
-    """Decode an audio payload → pydub AudioSegment at its native sample rate.
-
-    Accepts (mirrors _image_to_pil in img_utils):
-      - a pydub AudioSegment (returned as-is)
-      - encoded bytes in any format soundfile reads (FLAC, WAV, OGG, ...)
-      - a file path
-      - a dict with "bytes", "path", or "array" + "sampling_rate" keys
-        (the HF datasets Audio feature shape)
-
-    Uses soundfile for decoding (no ffmpeg required) so it works in any env.
-    Returns a pydub AudioSegment ready for resampling / format conversion.
-    """
-    try:
-        import soundfile as sf
-        from pydub import AudioSegment
-    except ImportError as e:
-        raise ImportError(
-            "audio_to_pydub_seg requires 'soundfile' and 'pydub'") from e
-
-    if isinstance(data, AudioSegment):
-        return data
-    if isinstance(data, (bytes, bytearray)):
-        audio_f, sr = sf.read(io.BytesIO(bytes(data)))
-        return _float_pcm_to_pydub_seg(audio_f, sr)
-    if isinstance(data, (str, os.PathLike)):
-        audio_f, sr = sf.read(data)
-        return _float_pcm_to_pydub_seg(audio_f, sr)
-    if isinstance(data, dict):
-        if data.get("bytes") is not None:
-            return audio_to_pydub_seg(bytes(data["bytes"]))
-        if data.get("path") is not None:
-            return audio_to_pydub_seg(data["path"])
-        if data.get("array") is not None and data.get("sampling_rate"):
-            return _float_pcm_to_pydub_seg(data["array"], data["sampling_rate"])
-    raise TypeError(f"Unsupported audio data type: {type(data)!r}")
-
-
-# Backward-compat alias (accepts any encoded bytes, not just FLAC)
-flac_to_pydub_seg = audio_to_pydub_seg
-
-
-def _float_pcm_to_pydub_seg(audio_f, sr):
-    """Float PCM samples + sample rate → pydub AudioSegment (via 16-bit WAV)."""
-    from pydub import AudioSegment
-
-    audio_i16 = (np.asarray(audio_f) * 32768).clip(-32768,
-                                                   32767).astype(np.int16)
-    buf = io.BytesIO()
-    with wave.open(buf, 'wb') as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(int(sr))
-        w.writeframes(audio_i16.tobytes())
-    buf.seek(0)
-    return AudioSegment.from_wav(buf)
-
-
-def chunk_pydub_audio(seg, chunk_ms: int = 1000) -> List[bytes]:
-    """Resample a pydub AudioSegment to 8 kHz / mono / 8-bit unsigned PCM and
-    split into fixed-duration chunks.
-
-    Each returned chunk is a complete WAV file in bytes (44-byte header +
-    8000 * (chunk_ms/1000) sample bytes), matching the format bGPT's audio
-    model was trained on.
-    """
-    from pydub import AudioSegment  # local import so the rest of the module stays lightweight
-
-    seg = seg.set_frame_rate(8000).set_channels(1).set_sample_width(1)
-    chunks: List[bytes] = []
-    for start in range(0, len(seg), chunk_ms):
-        out = io.BytesIO()
-        seg[start:start + chunk_ms].export(out, format='wav')
-        chunks.append(out.getvalue())
-    return chunks
+def pcm_payload_to_wav(payload: bytes) -> bytes:
+    """Wrap raw 8 kHz mono PCM_U8 frames in a WAV container."""
+    out = io.BytesIO()
+    with wave.open(out, "wb") as wav_file:
+        wav_file.setframerate(SAMPLE_RATE)
+        wav_file.setnchannels(CHANNELS)
+        wav_file.setsampwidth(SAMPLE_WIDTH)
+        wav_file.writeframes(payload)
+    return out.getvalue()

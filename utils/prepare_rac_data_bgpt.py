@@ -10,6 +10,10 @@ Base chunks are kept only at their full (modal) byte length so every retrieved
 condition shares one patch-aligned prefix length — the byte analog of the text
 prep's ``align_last_window`` (partial trailing chunks are dropped from the base).
 
+Audio datasets must be directories of preprocessed 8 kHz, mono, 8-bit PCM WAV
+files. Dataset download scripts perform decoding and format conversion once;
+this script validates the WAV files and indexes header-free PCM chunk payloads.
+
 Outputs under ``--out`` (a self-contained database, mirroring the text prep):
   base_chunks.pkl  [{id, sample_idx, ext, data (bytes)}]  retrieval units /
                    conditions; the eval reads ``base_tokens`` from ``data``.
@@ -44,7 +48,11 @@ from utils.bgpt_codec_utils import bytes_to_padded_tokens, make_bgpt_retriever
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Build the bGPT RAC retrieval database")
-    p.add_argument("--dataset", required=True, help="Audio/image dataset path (registered loader)")
+    p.add_argument(
+        "--dataset",
+        required=True,
+        help="Image dataset path, or directory of preprocessed WAV files",
+    )
     p.add_argument("--modality", required=True, choices=["image", "audio"])
     p.add_argument("--n-samples", type=int, default=None, help="Samples to load from the dataset")
     p.add_argument("--base-frac", type=float, default=0.5,
@@ -146,6 +154,8 @@ def main() -> None:
             "chunk_bytes": chunk_bytes, "chunk_size": chunk_size,
             "patch_size": args.patch_size, "ext": ext,
             "signals": args.retriever, "kgram": args.kgram}
+    if args.modality == "audio":
+        meta["payload_format"] = "pcm_u8"
     with open(os.path.join(args.out, "meta.json"), "w") as f:
         json.dump(meta, f)
     print(f"Database -> {args.out}")

@@ -76,6 +76,20 @@ corpus is chunked into fixed-size **byte** units, indexed by byte-k-gram BM25
 (mirrors `eval_bgpt`). Keep `chunk_patches * (max_cond + 1) + 2 ≤ 512` (the
 patch-decoder context) — pick `--patch-px` / `--chunk-ms` accordingly.
 
+Audio input is standardized before prepare/evaluation: dataset download scripts
+must export uncompressed 8 kHz, mono, 8-bit PCM WAV files. For People's Speech
+microset, each WAV is validated and then split into header-free PCM_U8 payloads:
+
+```
+python scripts/download_peoples_speech_microset.py \
+    --output datasets/peoples_speech_microset_wav
+
+python utils/prepare_rac_data_bgpt.py \
+    --dataset datasets/peoples_speech_microset_wav --modality audio \
+    --n-samples 200 --base-frac 0.5 --chunk-ms 250 --patch-size 16 \
+    --out results/rac_audio_db
+```
+
 ```
 # 1. Build the byte retrieval database (image example).
 python utils/prepare_rac_data_bgpt.py \

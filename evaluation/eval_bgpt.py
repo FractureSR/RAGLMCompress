@@ -11,10 +11,10 @@ python evaluation/eval_bgpt.py \\
     --device cuda:0 \\
     --output results/bgpt_image.csv
 
-# Audio (peoples_speech — pass the dataset directory; pd.read_parquet reads all parquets inside)
+# Audio (preprocessed 8 kHz / mono / 8-bit PCM WAV directory)
 python evaluation/eval_bgpt.py \\
     --modality audio \\
-    --dataset  datasets/peoples_speech \\
+    --dataset  datasets/peoples_speech_microset_wav \\
     --model    pretrained/bgpt/weights-audio.pth \\
     --n-samples 50 \\
     --device cuda:0,cuda:1 \\
@@ -24,7 +24,7 @@ python evaluation/eval_bgpt.py \\
 # Skip decompression (compression-only benchmark)
 python evaluation/eval_bgpt.py --modality image ... --no-decompress
 
-# New dataset: register a loader in utils/img_utils.py or utils/audio_utils.py
+# New audio datasets must be converted to the WAV format above before evaluation.
 """
 from __future__ import annotations
 from transformers import GPT2Config
@@ -42,6 +42,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.audio_utils import (
     load_audio_samples,
     chunk_audio_for_compression,
+    pcm_payload_to_wav,
 )
 from utils.img_utils import (
     load_image_files, reassemble_image_patches, ImagePatch,
@@ -316,7 +317,7 @@ def _audio_worker(
         if save_decomp_dir:
             for chunk_idx, d in enumerate(data):
                 if d[5] is not None:
-                    save_decompressed(d[5], save_decomp_dir,
+                    save_decompressed(pcm_payload_to_wav(d[5]), save_decomp_dir,
                                       f"{sample_id}_chunk{chunk_idx:04d}", "wav")
 
         results.append(EvalResult(
@@ -339,7 +340,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="bGPT compression evaluation")
     p.add_argument("--modality",   required=True, choices=["image", "audio"])
     p.add_argument("--dataset",    required=True,
-                   help="Dataset path (must match a registered image/audio loader name)")
+                   help="Image dataset path, or preprocessed WAV directory")
     p.add_argument("--model",      required=True,
                    help="Path to bGPT checkpoint (.pth)")
     p.add_argument("--n-samples",  type=int, default=None,
