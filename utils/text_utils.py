@@ -196,6 +196,16 @@ def _load_codeparrot_github_code_Java(path: str, n: Optional[int] = None, skip: 
 def _load_codeparrot_github_code_Python(path: str, n: Optional[int] = None, skip: int = 0) -> List[str]:
     return _load_jsonl(path, ("code",), n, skip)
 
+@register_text_loader("arxiv_tex/cs_ar.jsonl")
+def _load_arxiv_tex_cs_ar(path: str, n: Optional[int] = None, skip: int = 0) -> List[str]:
+    """Held-out eval docs persisted by prepare_rac_data_llm.py (one {"text": ...} per line)."""
+    return _load_jsonl(path, ("text",), n, skip)
+
+@register_text_loader("arxiv_tex/cs_cl.jsonl")
+def _load_arxiv_tex_cs_cl(path: str, n: Optional[int] = None, skip: int = 0) -> List[str]:
+    """Held-out eval docs persisted by prepare_rac_data_llm.py (one {"text": ...} per line)."""
+    return _load_jsonl(path, ("text",), n, skip)
+
 
 @register_text_loader("eval_docs.jsonl")
 def _load_rac_eval_docs(path: str, n: Optional[int] = None, skip: int = 0) -> List[str]:

@@ -5,11 +5,11 @@
 set -euo pipefail
 
 python utils/prepare_rac_data_llm.py \
-    --dataset datasets/codeparrot_github_code/C.jsonl \
-    --n-docs 4000 \
+    --dataset datasets/arxiv_tex/cs_cl.jsonl \
+    --n-docs 300 \
     --base-frac 0.5 \
     --chunk-size 512 --chunk-overlap 0 \
     --retriever bm25 \
     --seed 42 \
     --model pretrained/SmolLM2-135M \
-    --out results/rac_c_db
+    --out results/rac_arxiv_cl

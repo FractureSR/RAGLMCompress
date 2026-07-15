@@ -1,8 +1,13 @@
 python evaluation/eval_rac_llm.py \
-    --database results/rac_c_db \
+    --database results/rac_arxiv_cl \
     --model pretrained/SmolLM2-135M \
-    --m 16 \
     --n-docs 100 \
-    --device cuda:5 \
-    --max-tokens 2048 \
+    --m 4 \
+    --cascade \
+    --cascade-top-k 4 \
+    --cascade-retriever \
+    --calibrate \
+    --calib-docs 10 \
+    --device cuda:0 \
+    --max-tokens 8192 \
     --no-decompress
