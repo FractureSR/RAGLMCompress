@@ -11,7 +11,7 @@ python evaluation/eval_bgpt.py \\
     --device cuda:0 \\
     --output results/bgpt_image.csv
 
-# Audio (preprocessed 8 kHz / mono / 8-bit PCM WAV directory)
+# Audio (preprocessed native-rate / mono / 8-bit PCM WAV directory)
 python evaluation/eval_bgpt.py \\
     --modality audio \\
     --dataset  datasets/peoples_speech_microset_wav \\
@@ -227,7 +227,7 @@ def _audio_worker(
     no_decomp: bool,
     save_comp_dir: Optional[str],
     save_decomp_dir: Optional[str],
-    chunk_ms: int,
+    audio_chunk_bytes: int,
     max_decode_tokens: Optional[int] = None,
 ) -> List[EvalResult]:
     import tqdm
@@ -236,7 +236,7 @@ def _audio_worker(
     comp = BGPTCompressor(model, patch_size=PATCH_SIZE, device=device)
 
     # ── 1. Preprocessing: chunk all audio clips ───────────────────────────────
-    all_chunks = chunk_audio_for_compression(samples, indices, chunk_ms)
+    all_chunks = chunk_audio_for_compression(samples, indices, audio_chunk_bytes)
 
     # ── 2. Auto-select batch size ─────────────────────────────────────────────
     # All chunks are the same byte size; use the first as the representative length.
@@ -315,9 +315,11 @@ def _audio_worker(
         mem = data[0][4]
 
         if save_decomp_dir:
-            for chunk_idx, d in enumerate(data):
+            pos_list = sample_chunk_pos[local_idx]
+            for chunk_idx, (pos, d) in enumerate(zip(pos_list, data)):
                 if d[5] is not None:
-                    save_decompressed(pcm_payload_to_wav(d[5]), save_decomp_dir,
+                    wav_bytes = pcm_payload_to_wav(d[5], all_chunks[pos].sample_rate)
+                    save_decompressed(wav_bytes, save_decomp_dir,
                                       f"{sample_id}_chunk{chunk_idx:04d}", "wav")
 
         results.append(EvalResult(
@@ -357,8 +359,8 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Decode only the first N tokens per sample (round-trip check skipped)")
     p.add_argument("--image-patch-px", type=int, default=32,
                    help="Pixel patch size (image, default: 32)")
-    p.add_argument("--chunk-ms",       type=int, default=1000,
-                   help="Audio chunk duration ms (default: 1000)")
+    p.add_argument("--audio-chunk-bytes", type=int, default=8000,
+                   help="Audio chunk length in bytes (default: 8000)")
     p.add_argument("--tmp-dir", default="tmp",
                    help="Directory for inter-process temp files (default: tmp)")
     return p
@@ -394,7 +396,7 @@ def main():
                 no_decomp=args.no_decompress,
                 save_comp_dir=args.save_compressed,
                 save_decomp_dir=args.save_decompressed,
-                chunk_ms=args.chunk_ms,
+                audio_chunk_bytes=args.audio_chunk_bytes,
                 max_decode_tokens=args.max_decode_tokens,
             ),
             tmp_prefix=os.path.join(args.tmp_dir, '_eval_worker'),

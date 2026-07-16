@@ -32,7 +32,6 @@ with warnings.catch_warnings():
 
 REPO_ID = "MLCommons/peoples_speech"
 PARQUET_FILE = "microset/train-00000-of-00001.parquet"
-SAMPLE_RATE = 8000
 CHANNELS = 1
 SAMPLE_WIDTH = 1
 
@@ -64,27 +63,29 @@ def _decode_audio(encoded: bytes) -> AudioSegment:
     )
 
 
-def _convert_to_bgpt_wav(encoded: bytes, output_path: Path) -> int:
+def _convert_to_bgpt_wav(encoded: bytes, output_path: Path) -> tuple[int, int]:
+    """Convert to mono 8-bit PCM WAV, keeping the clip's native sample rate.
+
+    Returns (frame_count, sample_rate).
+    """
     segment = _decode_audio(encoded)
-    segment = segment.set_frame_rate(SAMPLE_RATE)
     segment = segment.set_channels(CHANNELS)
     segment = segment.set_sample_width(SAMPLE_WIDTH)
     segment.export(output_path, format="wav")
 
     with wave.open(str(output_path), "rb") as wav_file:
         actual = (
-            wav_file.getframerate(),
             wav_file.getnchannels(),
             wav_file.getsampwidth(),
             wav_file.getcomptype(),
         )
-        expected = (SAMPLE_RATE, CHANNELS, SAMPLE_WIDTH, "NONE")
+        expected = (CHANNELS, SAMPLE_WIDTH, "NONE")
         if actual != expected:
             raise ValueError(
                 f"Unexpected output WAV format for {output_path}: "
                 f"expected {expected}, got {actual}"
             )
-        return wav_file.getnframes()
+        return wav_file.getnframes(), wav_file.getframerate()
 
 
 def export_microset(
@@ -124,14 +125,15 @@ def export_microset(
 
                     filename = f"{exported:06d}.wav"
                     output_path = output_dir / filename
-                    frames = _convert_to_bgpt_wav(audio["bytes"], output_path)
+                    frames, sample_rate = _convert_to_bgpt_wav(audio["bytes"], output_path)
                     manifest.write(json.dumps({
                         "index": exported,
                         "file": filename,
                         "id": row["id"],
                         "source_path": audio.get("path"),
                         "source_duration_ms": row["duration_ms"],
-                        "duration_ms": frames * 1000 // SAMPLE_RATE,
+                        "duration_ms": frames * 1000 // sample_rate,
+                        "sample_rate": sample_rate,
                         "text": row["text"],
                     }, ensure_ascii=False) + "\n")
                     exported += 1
@@ -150,7 +152,7 @@ def export_microset(
             "num_samples": exported,
             "audio_format": {
                 "container": "wav",
-                "sample_rate": SAMPLE_RATE,
+                "sample_rate": "native (unchanged per clip; see manifest.jsonl)",
                 "channels": CHANNELS,
                 "sample_width_bytes": SAMPLE_WIDTH,
                 "codec": "PCM_U8",
@@ -165,7 +167,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Download People's Speech microset and convert it to "
-            "8 kHz mono 8-bit PCM WAV files."
+            "mono 8-bit PCM WAV files at each clip's native sample rate."
         )
     )
     parser.add_argument(

@@ -1,7 +1,22 @@
 """Load and chunk preprocessed bGPT audio.
 
-All input clips must be uncompressed 8 kHz, mono, 8-bit PCM WAV files. Dataset
-download scripts own decoding, resampling, channel conversion, and WAV export.
+Dataset loaders are registered by name. Every loader must return complete,
+uncompressed mono, 8-bit PCM WAV files as ``bytes``, at each clip's **native**
+sample rate (we no longer resample — dataset download scripts only convert
+channels and bit depth, not the sample rate).
+
+Because sample rate now varies clip-to-clip, compression/retrieval units are
+chunked by a fixed **byte** count (``audio_chunk_bytes``), not a fixed
+duration — the same duration would span a different number of bytes per clip
+and could overflow the model's context window.
+
+Adding a new dataset
+--------------------
+    from utils.audio_utils import register_audio_loader
+
+    @register_audio_loader("my_dataset")
+    def _load_my_dataset(path: str, n: Optional[int] = None) -> List[bytes]:
+        ...  # return complete preprocessed WAV files as bytes
 """
 from __future__ import annotations
 
@@ -11,16 +26,45 @@ import os
 import pickle
 import wave
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
 
-SAMPLE_RATE = 8000
 CHANNELS = 1
 SAMPLE_WIDTH = 1
 
 
+AudioLoader = Callable[[str, Optional[int]], List[bytes]]
+
+_AUDIO_LOADERS: Dict[str, AudioLoader] = {}
+
+
+def register_audio_loader(name: str):
+    """Register a loader selected by a normalized dataset path basename."""
+    def decorator(fn: AudioLoader) -> AudioLoader:
+        _AUDIO_LOADERS[name] = fn
+        return fn
+    return decorator
+
+
+def _find_audio_loader(path: str) -> AudioLoader:
+    key = os.path.basename(os.path.normpath(path)).lower().replace("-", "_")
+    for name, loader in _AUDIO_LOADERS.items():
+        if name.replace("-", "_") in key:
+            return loader
+    raise ValueError(
+        f"No audio loader registered for {path!r}.\n"
+        f"Known datasets: {sorted(_AUDIO_LOADERS)}.\n"
+        f"Register a new one with @register_audio_loader('name')."
+    )
+
+
 def load_audio_samples(path: str, n: Optional[int] = None) -> List[bytes]:
-    """Read preprocessed WAV files from a directory in filename order."""
+    """Dispatch to the registered loader for the audio dataset at *path*."""
+    return _find_audio_loader(path)(path, n)
+
+
+def _load_wav_dir(path: str, n: Optional[int]) -> List[bytes]:
+    """Read and validate preprocessed WAV files in filename order."""
     if not os.path.isdir(path):
         raise FileNotFoundError(f"Audio dataset directory not found: {path}")
 
@@ -43,9 +87,10 @@ def load_audio_samples(path: str, n: Optional[int] = None) -> List[bytes]:
 
 def load_rac_eval_samples(path: str, n: Optional[int] = None) -> List[bytes]:
     """Load preprocessed WAV bytes persisted by prepare_rac_data_bgpt."""
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"RAC eval pickle not found: {path}")
-    with open(path, "rb") as f:
+    pkl_path = os.path.join(path, "eval_samples.pkl") if os.path.isdir(path) else path
+    if not os.path.isfile(pkl_path):
+        raise FileNotFoundError(f"RAC eval pickle not found: {pkl_path}")
+    with open(pkl_path, "rb") as f:
         samples = pickle.load(f)
     selected = samples[:n] if n is not None else samples
     for sample_idx, sample in enumerate(selected):
@@ -54,8 +99,31 @@ def load_rac_eval_samples(path: str, n: Optional[int] = None) -> List[bytes]:
                 f"RAC eval sample {sample_idx} must be bytes, "
                 f"got {type(sample)!r}; rebuild the database"
             )
-        _validate_wav(sample, f"{path}[{sample_idx}]")
+        _validate_wav(sample, f"{pkl_path}[{sample_idx}]")
     return selected
+
+
+@register_audio_loader("eval_samples.pkl")
+def _load_rac_eval_samples(path: str, n: Optional[int] = None) -> List[bytes]:
+    return load_rac_eval_samples(path, n)
+
+
+@register_audio_loader("peoples_speech")
+def _load_peoples_speech(path: str, n: Optional[int] = None) -> List[bytes]:
+    return _load_wav_dir(path, n)
+
+
+@register_audio_loader("ljspeech")
+def _load_ljspeech(path: str, n: Optional[int] = None) -> List[bytes]:
+    return _load_wav_dir(path, n)
+
+
+@register_audio_loader("hf_wav_u8_8k_trimmed")
+def _load_hf_wav_u8_8k_trimmed(
+    path: str,
+    n: Optional[int] = None,
+) -> List[bytes]:
+    return _load_wav_dir(os.path.join(path, "audio"), n)
 
 
 def _validate_wav(data: bytes, source: str) -> None:
@@ -64,7 +132,6 @@ def _validate_wav(data: bytes, source: str) -> None:
     try:
         with wave.open(io.BytesIO(data), "rb") as wav_file:
             actual = (
-                wav_file.getframerate(),
                 wav_file.getnchannels(),
                 wav_file.getsampwidth(),
                 wav_file.getcomptype(),
@@ -72,11 +139,12 @@ def _validate_wav(data: bytes, source: str) -> None:
     except (EOFError, wave.Error) as exc:
         raise ValueError(f"Invalid WAV file: {source}") from exc
 
-    expected = (SAMPLE_RATE, CHANNELS, SAMPLE_WIDTH, "NONE")
+    # Sample rate is intentionally unchecked: clips keep their native rate.
+    expected = (CHANNELS, SAMPLE_WIDTH, "NONE")
     if actual != expected:
         raise ValueError(
-            f"Expected 8 kHz mono 8-bit PCM WAV for {source}, "
-            f"got rate/channels/sample-width/compression={actual}"
+            f"Expected mono 8-bit PCM WAV for {source}, "
+            f"got channels/sample-width/compression={actual}"
         )
 
 
@@ -90,28 +158,35 @@ class AudioChunkRecord:
 
     ``data`` contains raw unsigned 8-bit PCM frames without a WAV header.
     ``sample_idx`` identifies the source clip and ``chunk_idx`` is its position.
+    ``sample_rate`` is the source clip's native rate (frames == bytes here since
+    channels/sample-width are fixed at 1, so it isn't needed to size the chunk —
+    only to rebuild a playable WAV header, e.g. for --save-decompressed).
     """
-    data:       bytes
-    sample_idx: int   # index into the worker's local sample list
-    chunk_idx:  int   # 0-based position within this clip's chunks
+    data:        bytes
+    sample_idx:  int   # index into the worker's local sample list
+    chunk_idx:   int   # 0-based position within this clip's chunks
+    sample_rate: int   # native sample rate of the source clip
 
 
 def chunk_audio_for_compression(
     samples: Sequence[bytes],
     indices: List[int],
-    chunk_ms: int = 1000,
+    audio_chunk_bytes: int = 8000,
 ) -> List[AudioChunkRecord]:
     """Split all audio clips in a worker shard into a flat list of AudioChunkRecords.
 
-    Each input is already an 8 kHz mono 8-bit PCM WAV. This function strips the
-    container and returns chunks containing only raw PCM frames.
-    Mirrors chunk_documents_for_compression in text_utils.
+    Each input is a mono 8-bit PCM WAV at its own native sample rate. This
+    function strips the container and returns chunks containing only raw PCM
+    frames, exactly ``audio_chunk_bytes`` bytes each (one byte == one frame
+    for mono 8-bit PCM). Chunking is byte-count based — not duration based —
+    because clips no longer share a common sample rate: a fixed duration
+    would span a different number of bytes per clip and could overflow the
+    model's context window. Mirrors chunk_documents_for_compression in
+    text_utils.
     """
-    if chunk_ms <= 0:
-        raise ValueError(f"chunk_ms must be positive, got {chunk_ms}")
-    frames_per_chunk = SAMPLE_RATE * chunk_ms // 1000
-    if frames_per_chunk <= 0:
-        raise ValueError(f"chunk_ms={chunk_ms} produces an empty chunk")
+    if audio_chunk_bytes <= 0:
+        raise ValueError(
+            f"audio_chunk_bytes must be positive, got {audio_chunk_bytes}")
 
     all_records: List[AudioChunkRecord] = []
     for local_idx, i in enumerate(indices):
@@ -119,14 +194,16 @@ def chunk_audio_for_compression(
         _validate_wav(data, f"sample {i}")
         sample_chunks = 0
         with wave.open(io.BytesIO(data), "rb") as wav_file:
+            rate = wav_file.getframerate()
             while True:
-                frames = wav_file.readframes(frames_per_chunk)
+                frames = wav_file.readframes(audio_chunk_bytes)
                 if not frames:
                     break
                 all_records.append(AudioChunkRecord(
                     data=frames,
                     sample_idx=local_idx,
                     chunk_idx=sample_chunks,
+                    sample_rate=rate,
                 ))
                 sample_chunks += 1
         if sample_chunks == 0:
@@ -135,14 +212,14 @@ def chunk_audio_for_compression(
 
 
 # ---------------------------------------------------------------------------
-# bGPT audio format helpers (8 kHz / mono / 8-bit unsigned PCM)
+# bGPT audio format helpers (native sample rate / mono / 8-bit unsigned PCM)
 # ---------------------------------------------------------------------------
 
-def pcm_payload_to_wav(payload: bytes) -> bytes:
-    """Wrap raw 8 kHz mono PCM_U8 frames in a WAV container."""
+def pcm_payload_to_wav(payload: bytes, sample_rate: int) -> bytes:
+    """Wrap raw mono PCM_U8 frames in a WAV container at the given sample rate."""
     out = io.BytesIO()
     with wave.open(out, "wb") as wav_file:
-        wav_file.setframerate(SAMPLE_RATE)
+        wav_file.setframerate(sample_rate)
         wav_file.setnchannels(CHANNELS)
         wav_file.setsampwidth(SAMPLE_WIDTH)
         wav_file.writeframes(payload)

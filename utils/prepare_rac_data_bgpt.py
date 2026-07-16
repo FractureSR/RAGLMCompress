@@ -2,17 +2,22 @@
 
 The byte-domain counterpart of ``prepare_rac_data_llm.py``: fix a slice of an
 audio/image dataset as the base corpus, chunk it into fixed-size **byte** chunks
-(one bGPT compression/retrieval unit — an image patch or an audio chunk), and
+(one retrieval/condition unit — an image patch or a small audio chunk), and
 index them by byte similarity. ``eval_rac_bgpt.py`` then chunks + retrieves the
-held-out eval samples *live*, exactly the way ``eval_bgpt.py`` chunks its input.
+held-out eval samples *live*. As in the text prep, the condition unit here is
+independent of the eval-side payload window: audio eval payloads default to
+filling the bGPT context left after the prefix budget (like text's
+``ctx_len - max_ctx``), while conditions keep this database's granularity.
 
 Base chunks are kept only at their full (modal) byte length so every retrieved
 condition shares one patch-aligned prefix length — the byte analog of the text
 prep's ``align_last_window`` (partial trailing chunks are dropped from the base).
 
-Audio datasets must be directories of preprocessed 8 kHz, mono, 8-bit PCM WAV
-files. Dataset download scripts perform decoding and format conversion once;
-this script validates the WAV files and indexes header-free PCM chunk payloads.
+Audio datasets must be directories of preprocessed mono, 8-bit PCM WAV files at
+their native sample rate (no resampling). Dataset download scripts perform
+decoding and format conversion once; this script validates the WAV files and
+indexes header-free PCM chunk payloads, chunked by a fixed byte count since
+clips no longer share a common sample rate.
 
 Outputs under ``--out`` (a self-contained database, mirroring the text prep):
   base_chunks.pkl  [{id, sample_idx, ext, data (bytes)}]  retrieval units /
@@ -21,9 +26,9 @@ Outputs under ``--out`` (a self-contained database, mirroring the text prep):
                    ``eval_docs.jsonl``); the eval chunks + retrieves them live.
   retriever/       saved BM25 byte index.
   meta.json        {dataset, modality, seed, base_frac, n_samples,
-                    base_sample_indices, unit (patch_px|chunk_ms), chunk_bytes,
-                    chunk_size (token length, a multiple of patch_size),
-                    patch_size, ext, signals, kgram}.
+                    base_sample_indices, unit (patch_px|audio_chunk_bytes),
+                    unit_bytes, chunk_size (token length, a multiple of
+                    patch_size), patch_size, ext, signals, kgram}.
 
 Example
 -------
@@ -59,8 +64,8 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Fraction of samples fixed as the base/database (rest are eval)")
     p.add_argument("--patch-px", type=int, default=16,
                    help="image: pixel patch size = one retrieval/compression unit")
-    p.add_argument("--chunk-ms", type=int, default=250,
-                   help="audio: chunk duration ms = one retrieval/compression unit")
+    p.add_argument("--audio-chunk-bytes", type=int, default=512,
+                   help="audio: chunk length in bytes = one retrieval/condition unit")
     p.add_argument("--patch-size", type=int, default=16,
                    help="bGPT byte-patch size (must match the model)")
     p.add_argument("--retriever", default="bm25", choices=["bm25"],
@@ -81,12 +86,12 @@ def _load_samples(modality: str, path: str, n):
         return load_audio_samples(path, n)
 
 
-def _chunk_base(modality: str, samples, base_indices, patch_px: int, chunk_ms: int):
+def _chunk_base(modality: str, samples, base_indices, patch_px: int, audio_chunk_bytes: int):
     """Chunk the base samples into (byte payload, source sample idx) records.
 
-    Reuses the exact preprocessors ``eval_bgpt.py``/``eval_rac_bgpt.py`` use, so
-    base and eval units are produced identically. ``sample_idx`` is the *global*
-    dataset index of the sample a chunk came from (for provenance).
+    Uses the same preprocessors as ``eval_bgpt.py``/``eval_rac_bgpt.py``.
+    ``sample_idx`` is the *global* dataset index of the sample a chunk came
+    from (for provenance).
     """
     if modality == "image":
         from utils.img_utils import patchify_images_for_compression
@@ -94,7 +99,8 @@ def _chunk_base(modality: str, samples, base_indices, patch_px: int, chunk_ms: i
         return [(r.patch.data, base_indices[r.sample_idx]) for r in recs], "bmp"
     elif modality == "audio":
         from utils.audio_utils import chunk_audio_for_compression
-        recs = chunk_audio_for_compression(samples, base_indices, chunk_ms=chunk_ms)
+        recs = chunk_audio_for_compression(
+            samples, base_indices, audio_chunk_bytes=audio_chunk_bytes)
         return [(r.data, base_indices[r.sample_idx]) for r in recs], "wav"
 
 
@@ -114,18 +120,18 @@ def main() -> None:
     # Chunk the base samples into byte units, then keep only full-length chunks so
     # every base condition shares one patch-aligned prefix length (drop partials).
     chunk_recs, ext = _chunk_base(args.modality, samples, base_sample_indices,
-                                  args.patch_px, args.chunk_ms)
+                                  args.patch_px, args.audio_chunk_bytes)
     if not chunk_recs:
         raise ValueError("No base chunks produced; increase --n-samples or --base-frac")
 
-    chunk_bytes = max(len(d) for d, _ in chunk_recs)
+    unit_bytes = max(len(d) for d, _ in chunk_recs)
     base_chunks = [
         {"id": i, "sample_idx": sidx, "ext": ext, "data": bytes(data)}
-        for i, (data, sidx) in enumerate(d for d in chunk_recs if len(d[0]) == chunk_bytes)
+        for i, (data, sidx) in enumerate(d for d in chunk_recs if len(d[0]) == unit_bytes)
     ]
     dropped = len(chunk_recs) - len(base_chunks)
     chunk_size = len(bytes_to_padded_tokens(base_chunks[0]["data"], args.patch_size))
-    print(f"Base chunks (retrieval units): {len(base_chunks)} of {chunk_bytes} B "
+    print(f"Base chunks (retrieval units): {len(base_chunks)} of {unit_bytes} B "
           f"({chunk_size} byte-tokens) | dropped {dropped} partial chunks")
 
     os.makedirs(args.out, exist_ok=True)
@@ -150,8 +156,8 @@ def main() -> None:
             "base_frac": args.base_frac, "n_samples": args.n_samples,
             "base_sample_indices": base_sample_indices,
             "unit": {"patch_px": args.patch_px} if args.modality == "image"
-                    else {"chunk_ms": args.chunk_ms},
-            "chunk_bytes": chunk_bytes, "chunk_size": chunk_size,
+                    else {"audio_chunk_bytes": args.audio_chunk_bytes},
+            "unit_bytes": unit_bytes, "chunk_size": chunk_size,
             "patch_size": args.patch_size, "ext": ext,
             "signals": args.retriever, "kgram": args.kgram}
     if args.modality == "audio":

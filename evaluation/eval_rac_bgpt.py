@@ -2,12 +2,20 @@
 
 The byte-domain counterpart of ``eval_rac_llm.py``: it is to ``eval_bgpt.py`` what
 ``eval_rac_llm.py`` is to ``eval_llm.py``. It loads a database built by
-``prepare_rac_data_bgpt.py``, chunks the held-out eval samples into byte units
-(image patches / audio chunks) exactly as ``eval_bgpt.py`` does, retrieves top-m
-similar base chunks per unit, and runs ``RACBGPTCompressor``'s oracle (keep the
-best retrieved byte prefix only if it beats its transmitted-id cost, else no
-condition). The chosen base ids travel as side info; their bit cost is added for
-honest bpb/ratio, just like the text eval.
+``prepare_rac_data_bgpt.py``, chunks the held-out eval samples into byte payload
+units, retrieves top-m similar base chunks per unit, and runs
+``RACBGPTCompressor``'s oracle (keep the best retrieved byte prefix only if it
+beats its transmitted-id cost, else no condition). The chosen base ids travel as
+side info; their bit cost is added for honest bpb/ratio, just like the text eval.
+
+Payload vs condition size (the text analogy): as in ``eval_rac_llm.py`` — where
+the data piece is ``ctx_len - max_ctx`` LM tokens while conditions keep the
+database ``chunk_size`` — the audio payload window defaults to the byte context
+left after the prefix budget (override with ``--audio-chunk-bytes``), while each
+retrieved condition stays one database chunk. Retrieval queries with the whole
+payload; the chosen conditions are prepended as byte prefixes and the combined
+sequence is patchified/padded to bGPT's format by the compressor. Image payloads
+remain single database-sized patches (a 2D unit has no window to grow).
 
 Usage
 -----
@@ -86,14 +94,12 @@ def _load_database(database_dir: str, signals: str, kgram: int, patch_size: int)
 
 
 def _load_samples(modality: str, path: str, n: Optional[int]):
-    """Load an image corpus, WAV directory, or persisted RAC eval samples."""
+    """Load eval samples through the modality's registered dataset loaders."""
     if modality == "image":
         from utils.img_utils import load_image_files
         return load_image_files(path, n)
     elif modality == "audio":
-        from utils.audio_utils import load_audio_samples, load_rac_eval_samples
-        if os.path.basename(path) == "eval_samples.pkl":
-            return load_rac_eval_samples(path, n)
+        from utils.audio_utils import load_audio_samples
         return load_audio_samples(path, n)
     raise ValueError(f"unsupported modality: {modality!r}")
 
@@ -101,8 +107,10 @@ def _load_samples(modality: str, path: str, n: Optional[int]):
 def _chunk_eval_samples(modality: str, samples, indices: List[int], unit: dict):
     """Chunk a shard of eval samples into (data, ext, sample_local_idx) byte units.
 
-    Reuses the same preprocessors as eval_bgpt so eval and base units match.
-    sample_local_idx indexes into ``indices`` (the shard), for per-sample rollup.
+    ``unit`` sizes the eval-side payload window: for image it is the database
+    patch size, for audio it is the (decoupled, usually much larger) payload
+    byte window computed in ``main``. sample_local_idx indexes into ``indices``
+    (the shard), for per-sample rollup.
     """
     if modality == "image":
         from utils.img_utils import patchify_images_for_compression
@@ -110,7 +118,8 @@ def _chunk_eval_samples(modality: str, samples, indices: List[int], unit: dict):
         return [(r.patch.data, "bmp", r.sample_idx) for r in recs]
     elif modality == "audio":
         from utils.audio_utils import chunk_audio_for_compression
-        recs = chunk_audio_for_compression(samples, indices, chunk_ms=unit["chunk_ms"])
+        recs = chunk_audio_for_compression(
+            samples, indices, audio_chunk_bytes=unit["audio_chunk_bytes"])
         return [(r.data, "wav", r.sample_idx) for r in recs]
 
 
@@ -212,7 +221,7 @@ def _rac_worker(
         with torch.inference_mode():
             model(patches=padded["patches"], masks=padded["masks"])
 
-    score_lens = [cfg["chunk_size"] + cfg["max_ctx"]]
+    score_lens = [cfg["payload_bytes"] + cfg["max_ctx"]]
     score_batch_size = cfg["batch_size"] or auto_batch_size(
         _probe, device, score_lens, max_batch=256,
         n_samples=max(1, len(segments) * m), verbose=True,
@@ -347,7 +356,7 @@ def _calibrate(device, model_path, samples, calib_idx, database_dir, modality, u
             with torch.inference_mode():
                 model(patches=padded["patches"], masks=padded["masks"])
 
-        score_lens = [cfg["chunk_size"] + cfg["max_ctx"]]
+        score_lens = [cfg["payload_bytes"] + cfg["max_ctx"]]
         rac.batch_size = cfg["batch_size"] or auto_batch_size(
             _probe, device, score_lens, max_batch=256,
             n_samples=max(1, len(segments) * m), verbose=False,
@@ -407,6 +416,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--n-samples", type=int, default=None,
                    help="cap on eval samples (default: all held-out samples)")
     p.add_argument("--m", type=int, default=16, help="top-k candidates tried per unit")
+    p.add_argument("--audio-chunk-bytes", type=int, default=None,
+                   help=("audio payload bytes per compression unit (default: fill "
+                         "the byte context left after the prefix budget, the "
+                         "analog of eval_rac_llm's ctx_len - max_ctx)"))
     p.add_argument("--max-ctx", type=int, default=None,
                    help="total prefix byte-token budget (default: chunk_size * max conditions)")
     p.add_argument("--margin-bits", type=float, default=0.0)
@@ -442,19 +455,28 @@ def main() -> None:
     modality = meta["modality"]
     unit = meta["unit"]
     patch_size = meta["patch_size"]
-    chunk_size = meta["chunk_size"]            # base unit token length (multiple of patch_size)
+    chunk_size = meta["chunk_size"]            # condition token length (multiple of patch_size)
     max_cond = args.cascade_max_cond if args.cascade else 1
     max_ctx = args.max_ctx if args.max_ctx is not None else chunk_size * max_cond
 
-    # Prefix + payload + ext + trailing patch must fit the patch-decoder context.
-    chunk_patches = chunk_size // patch_size
-    total_patches = chunk_patches * (max_cond + 1) + 2
-    if total_patches > PATCH_LENGTH:
+    # Payload window, decoupled from the condition size (the text analogy:
+    # eval_rac_llm's data piece is ctx_len - max_ctx while conditions keep the
+    # database chunk_size). byte_ctx is the byte budget once the ext and
+    # trailing pad patches are set aside; prefix + payload must fit in it.
+    # (Both get patch-padded, but max_ctx and byte_ctx are patch multiples, so
+    # the byte-level check is exact.)
+    byte_ctx = (PATCH_LENGTH - 2) * patch_size
+    if modality == "audio":
+        payload_bytes = args.audio_chunk_bytes or byte_ctx - max_ctx
+        unit = {"audio_chunk_bytes": payload_bytes}
+    else:
+        payload_bytes = chunk_size
+    if payload_bytes <= 0 or payload_bytes + max_ctx > byte_ctx:
         raise ValueError(
-            f"config exceeds bGPT context: {chunk_patches} chunk patches x "
-            f"(max_cond {max_cond} + 1) + 2 = {total_patches} > {PATCH_LENGTH}. "
-            f"Rebuild the database with a smaller --patch-px/--chunk-ms, or lower "
-            f"--cascade-max-cond.")
+            f"payload {payload_bytes} B + prefix budget {max_ctx} B exceeds the "
+            f"bGPT byte context {byte_ctx} B ({PATCH_LENGTH} patches minus ext "
+            f"and trailing pad). Lower --audio-chunk-bytes / --cascade-max-cond, "
+            f"or rebuild the database with smaller units.")
 
     # Eval set = the held-out samples persisted by prepare_rac_data_bgpt
     # (self-contained, no re-load/complement), or a fresh --dataset override.
@@ -477,11 +499,13 @@ def main() -> None:
         test_idx = all_idx
     source = eval_path
     print(f"Loaded {len(samples)} held-out {modality} samples from {source} | "
-          f"eval {len(test_idx)} | unit {unit} | chunk {chunk_size} tok "
-          f"(prefix budget {max_ctx}) | m {args.m} | devices: {devices}")
+          f"eval {len(test_idx)} | payload {payload_bytes} B | condition "
+          f"{chunk_size} tok x {max_cond} (prefix budget {max_ctx}) | "
+          f"m {args.m} | devices: {devices}")
 
     cfg = dict(
         patch_size=patch_size, chunk_size=chunk_size, max_ctx=max_ctx,
+        payload_bytes=payload_bytes,
         margin_bits=args.margin_bits, batch_size=args.batch_size,
         cascade=args.cascade, cascade_max_cond=args.cascade_max_cond,
         cascade_nll_thresh=args.cascade_nll_thresh,
