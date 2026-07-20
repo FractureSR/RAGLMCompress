@@ -15,11 +15,11 @@ set -euo pipefail
 
 # Audio
 python utils/prepare_rac_data_bgpt.py \
-     --dataset datasets/peoples_speech_microset_wav --modality audio \
-     --n-samples 300 \
+     --dataset datasets/vtck/p225 --modality audio \
+     --n-samples 200 \
      --base-frac 0.5 \
      --audio-chunk-bytes 512 \
      --retriever bm25 \
-     --kgram 16 \
+     --kgram 8 \
      --seed 42 \
-     --out results/rac_peoples_speech
+     --out results/rac_vtck_p225

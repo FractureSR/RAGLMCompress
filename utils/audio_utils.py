@@ -108,13 +108,16 @@ def _load_rac_eval_samples(path: str, n: Optional[int] = None) -> List[bytes]:
     return load_rac_eval_samples(path, n)
 
 
-@register_audio_loader("peoples_speech")
-def _load_peoples_speech(path: str, n: Optional[int] = None) -> List[bytes]:
+@register_audio_loader("ljspeech_wav")
+def _load_ljspeech(path: str, n: Optional[int] = None) -> List[bytes]:
     return _load_wav_dir(path, n)
 
+@register_audio_loader("p225")
+def _load_vtck(path: str, n: Optional[int] = None) -> List[bytes]:
+    return _load_wav_dir(path, n)
 
-@register_audio_loader("ljspeech")
-def _load_ljspeech(path: str, n: Optional[int] = None) -> List[bytes]:
+@register_audio_loader("p226")
+def _load_vtck(path: str, n: Optional[int] = None) -> List[bytes]:
     return _load_wav_dir(path, n)
 
 

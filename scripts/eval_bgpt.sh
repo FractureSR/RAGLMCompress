@@ -10,10 +10,10 @@
 # Audio
 python evaluation/eval_bgpt.py \
     --modality audio \
-    --dataset  results/rac_peoples_speech/eval_samples.pkl \
+    --dataset  results/rac_vtck_p225/eval_samples.pkl \
     --model    pretrained/bgpt/weights-audio.pth \
-    --n-samples 100 \
-    --device cuda:0,cuda:1 \
-    --audio-chunk-bytes 8000 \
+    --n-samples 50 \
+    --device cuda:3 \
+    --audio-chunk-bytes 8160 \
     --no-decompress \
     

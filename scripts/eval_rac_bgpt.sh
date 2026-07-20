@@ -7,14 +7,14 @@
 
 # Audio:
  python evaluation/eval_rac_bgpt.py \
-     --database results/rac_peoples_speech \
+     --database results/rac_vtck_p225/ \
      --model pretrained/bgpt/weights-audio.pth \
      --m 4 \
-     --device cuda:2 \
-     --n-samples 100 \
+     --device cuda:3 \
+     --n-samples 50 \
      --cascade \
      --cascade-max-cond 2 \
      --cascade-retriever \
      --calibrate \
-     --calib-samples 20 \
+     --calib-samples 10 \
      --no-decompress
