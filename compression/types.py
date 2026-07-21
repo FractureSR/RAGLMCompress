@@ -25,9 +25,9 @@ class LMScore:
 
     Returned by ``score_batch`` (the cheap counterpart of ``compress_batch``):
     the same forward pass and per-token NLL the coder would use, exposed so a
-    caller can *rank* prompt contexts by exact code length and inspect where the
-    model is still surprised — without paying for the range coder. ``bits`` is the
-    ideal data code length (``sum(token_nll) / ln 2``); ``token_nll`` is the
+    caller can rank prompt contexts by ideal model code length and inspect where
+    the model is still surprised — without paying for the range coder. ``bits``
+    is ``sum(token_nll) / ln 2``; ``token_nll`` is the
     per-token negative log-likelihood in nats (used e.g. to find high-entropy
     residual tokens for RAC's cascade).
     """

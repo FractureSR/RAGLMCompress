@@ -8,19 +8,12 @@ import torch
 
 PAD_TOKEN = 256
 VOCAB_SIZE = 257
+RAC_BGPT_DB_FORMAT_VERSION = 1
 
 
 def extension_tokens(ext: str, patch_size: int) -> List[int]:
     ext = ext.lower().lstrip(".")
     return list(ext.encode("utf-8"))[:patch_size]
-
-
-def bytes_to_padded_tokens(raw_bytes: bytes, patch_size: int) -> List[int]:
-    tokens = list(raw_bytes)
-    remainder = len(tokens) % patch_size
-    if remainder:
-        tokens.extend([PAD_TOKEN] * (patch_size - remainder))
-    return tokens
 
 
 def tokens_to_bytes(tokens: Sequence[int]) -> bytes:
@@ -85,17 +78,23 @@ def pad_input_for_bgpt(
 # eval_rac_bgpt.py (load); pass the same signals/kgram to both since the
 # tokenizer callable is not persisted.
 
-def bgpt_bytes_tokenize(data, kgram: int = 4) -> List[str]:
+def bgpt_bytes_tokenize(data: bytes, kgram: int = 4) -> List[str]:
     """Tokenise a byte payload into overlapping k-gram words for BM25.
 
     The byte-domain counterpart of ``text_utils.bm25_tokenize``: each sliding
     window of ``kgram`` bytes becomes one hashable token (hex-encoded so ``bm25s``
     sees plain strings), so chunks with locally similar byte sequences score high.
     """
-    b = bytes(data)
-    if len(b) <= kgram:
-        return [b.hex()] if b else []
-    return [b[i:i + kgram].hex() for i in range(len(b) - kgram + 1)]
+    if kgram <= 0:
+        raise ValueError(f"kgram must be positive, got {kgram}")
+    if not isinstance(data, bytes):
+        raise TypeError(f"byte retriever items must be bytes, got {type(data)!r}")
+    if len(data) <= kgram:
+        return [data.hex()] if data else []
+    return [
+        data[i:i + kgram].hex()
+        for i in range(len(data) - kgram + 1)
+    ]
 
 
 def make_bgpt_retriever(signals: str = "bm25", kgram: int = 4, rrf_k: int = 60):
@@ -109,6 +108,8 @@ def make_bgpt_retriever(signals: str = "bm25", kgram: int = 4, rrf_k: int = 60):
     natural ``"dense"``/``"hybrid"`` extension but is not implemented yet. The
     same factory (same ``signals``/``kgram``) must be used to build and to load.
     """
+    if kgram <= 0:
+        raise ValueError(f"kgram must be positive, got {kgram}")
     from functools import partial
     from utils.rag_utils import Retriever, BM25Scorer
     if signals != "bm25":

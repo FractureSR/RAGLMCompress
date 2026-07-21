@@ -81,7 +81,8 @@ def _text_worker(
 
     model, tokenizer = _load_model(model_path, device)
     comp = LLMCompressor(model, tokenizer, device=device)
-    max_tok = max_tokens or tokenizer.model_max_length
+    max_tok = (
+        max_tokens if max_tokens is not None else tokenizer.model_max_length)
     pad_id = tokenizer.pad_token_id
 
     # ── 1. Preprocessing: split documents that exceed the context window ──────

@@ -18,9 +18,8 @@ import io
 import os
 import pickle
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-import numpy as np
 from PIL import Image
 
 
@@ -37,7 +36,10 @@ def register_image_loader(name: str):
     """Decorator to register an image dataset loader by name.
 
     Detection: *name* (hyphens normalised to underscores) must appear as a
-    substring of the normalised dataset path.
+    substring of the whole normalised dataset path, so multi-segment names
+    like ``"eurosat/Forest"`` match a path ``datasets/eurosat/Forest`` — not
+    just the final basename. When several names match, the longest (most
+    specific) one wins.
     """
     def decorator(fn: ImageLoader) -> ImageLoader:
         _IMAGE_LOADERS[name] = fn
@@ -46,10 +48,15 @@ def register_image_loader(name: str):
 
 
 def _find_image_loader(path: str) -> ImageLoader:
-    key = os.path.basename(os.path.normpath(path)).lower().replace("-", "_")
+    key = os.path.normpath(path).replace(os.sep, "/").lower().replace("-", "_")
+    best_loader: Optional[ImageLoader] = None
+    best_len = -1
     for name, loader in _IMAGE_LOADERS.items():
-        if name.replace("-", "_") in key:
-            return loader
+        needle = name.replace(os.sep, "/").lower().replace("-", "_")
+        if needle in key and len(needle) > best_len:
+            best_loader, best_len = loader, len(needle)
+    if best_loader is not None:
+        return best_loader
     raise ValueError(
         f"No image loader registered for {path!r}.\n"
         f"Known datasets: {sorted(_IMAGE_LOADERS)}.\n"
@@ -86,8 +93,9 @@ def _load_image_dir(
     return files[:n] if n is not None else files
 
 
+@register_image_loader("eval_samples.pkl")
 def load_rac_eval_samples(path: str, n: Optional[int] = None) -> List[str]:
-    """Load eval_samples.pkl emitted by prepare_rac_data_bgpt."""
+    """Load held-out image paths emitted by prepare_rac_data_bgpt."""
     pkl_path = path
     if os.path.isdir(path):
         pkl_path = os.path.join(path, "eval_samples.pkl")
@@ -95,17 +103,18 @@ def load_rac_eval_samples(path: str, n: Optional[int] = None) -> List[str]:
         raise FileNotFoundError(f"RAC eval pickle not found: {pkl_path}")
     with open(pkl_path, "rb") as f:
         samples = pickle.load(f)
-    return samples[:n] if n is not None else samples
+    selected = samples[:n] if n is not None else samples
+    for sample_idx, sample in enumerate(selected):
+        if not isinstance(sample, str):
+            raise TypeError(
+                f"RAC image sample {sample_idx} must be a file path string, "
+                f"got {type(sample)!r}; rebuild the database")
+    return selected
 
 
 # ---------------------------------------------------------------------------
 # Built-in dataset loaders
 # ---------------------------------------------------------------------------
-
-@register_image_loader("eval_samples.pkl")
-def _load_rac_eval_samples(path: str, n: Optional[int] = None) -> List[str]:
-    return load_rac_eval_samples(path, n)
-
 
 @register_image_loader("clic2024")
 def _load_clic2024(path: str, n: Optional[int] = None) -> List[str]:
@@ -118,144 +127,182 @@ def _load_clic2024(path: str, n: Optional[int] = None) -> List[str]:
 
 @dataclass
 class ImagePatchRecord:
-    """A single image patch with provenance, produced by patchify_images_for_compression.
+    """One image patch with provenance, produced by patchify_images_for_compression.
 
-    Mirrors TextChunk in text_utils: patch is the payload, sample_idx identifies
-    the source image so chunk-level results can be aggregated back per image.
-    meta is shared across all patches of the same image and is stored here so
-    the aggregation step needs only this flat list — no separate sample_info dict.
+    The 2D analog of ``AudioChunkRecord`` — one flat struct, no nesting. ``data``
+    is the header-free BMP pixel array: BGR channels, bottom-up rows, and
+    four-byte row alignment. ``sample_idx`` identifies the source image and
+    ``patch_idx`` is the raster position within it. ``orig_width``/``orig_height``
+    and the rectangular ``patch_width``/``patch_height`` are enough to place the
+    patch and crop the image back. Patch x/y are derived from ``patch_idx`` at
+    reassembly, not stored.
     """
-    patch:      "ImagePatch"
-    sample_idx: int             # index into the worker's local sample list
-    meta:       "ImagePatchMeta"
-
-
-@dataclass
-class ImagePatch:
-    index: int
-    x: int
-    y: int
-    width: int
-    height: int
-    data: bytes          # BMP bytes for this patch
-
-
-@dataclass
-class ImagePatchMeta:
-    original_width: int
-    original_height: int
-    padded_width: int
-    padded_height: int
-    patch_size: int
-    mode: str
+    data:        bytes
+    sample_idx:  int   # index into the worker's local sample list
+    patch_idx:   int   # 0-based raster position within this image's patches
+    orig_width:  int   # source image width  (to place patches and crop back)
+    orig_height: int   # source image height
+    patch_width: int   # patch width in pixels
+    patch_height: int  # patch height in pixels
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _image_to_pil(data: Any) -> Image.Image:
-    if isinstance(data, Image.Image):
-        return data
-    if isinstance(data, np.ndarray):
-        return Image.fromarray(data)
-    if isinstance(data, (bytes, bytearray)):
-        return Image.open(io.BytesIO(data)).convert("RGB")
-    if isinstance(data, dict):
-        if data.get("bytes") is not None:
-            return Image.open(io.BytesIO(data["bytes"])).convert("RGB")
-        if data.get("path") is not None:
-            return Image.open(data["path"]).convert("RGB")
-        if data.get("array") is not None:
-            return Image.fromarray(np.asarray(data["array"]))
-    raise TypeError(f"Unsupported image data type: {type(data)!r}")
+def _bmp_row_stride(width: int) -> int:
+    """Return the byte width of one 24-bit BMP row, including alignment."""
+    return ((width * 3 + 3) // 4) * 4
 
 
-def _pil_to_bmp_bytes(image: Image.Image) -> bytes:
-    buf = io.BytesIO()
-    image.save(buf, format="BMP")
-    return buf.getvalue()
+def bmp_payload_nbytes(width: int, height: int) -> int:
+    """Byte length of a header-free 24-bit BMP pixel array."""
+    if width <= 0 or height <= 0:
+        raise ValueError(
+            f"BMP patch dimensions must be positive, got {width}x{height}")
+    return _bmp_row_stride(width) * height
 
 
-def _bmp_bytes_to_pil(raw_bytes: bytes) -> Image.Image:
-    return Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+def validate_bmp_patch_shape(
+    payload_bytes: int,
+    width: int,
+    height: int,
+) -> Tuple[int, int]:
+    """Validate an explicit rectangle against an exact BMP payload budget."""
+    if payload_bytes <= 0:
+        raise ValueError(f"payload_bytes must be positive, got {payload_bytes}")
+    if width <= 0:
+        raise ValueError(f"image patch width must be positive, got {width}")
+    if height <= 0:
+        raise ValueError(f"image patch height must be positive, got {height}")
+    actual = bmp_payload_nbytes(width, height)
+    if actual != payload_bytes:
+        raise ValueError(
+            f"image patch {width}x{height} has a {actual} B BMP payload, "
+            f"but this window requires exactly {payload_bytes} B")
+    return width, height
+
+
+def _pil_to_bmp_payload(image: Image.Image) -> bytes:
+    """Encode an RGB image as BMP's pixel array, without file/DIB headers."""
+    if image.mode != "RGB":
+        raise ValueError(f"bGPT image patches must be RGB, got mode={image.mode!r}")
+    return image.tobytes(
+        "raw", "BGR", _bmp_row_stride(image.width), -1)
+
+
+def _bmp_payload_to_pil(data: bytes, width: int, height: int) -> Image.Image:
+    """Decode a header-free 24-bit BMP pixel array into an RGB image."""
+    stride = _bmp_row_stride(width)
+    expected = stride * height
+    if len(data) != expected:
+        raise ValueError(
+            f"Invalid BMP pixel payload length: got {len(data)}, expected {expected}"
+        )
+    return Image.frombytes("RGB", (width, height), data, "raw", "BGR", stride, -1)
+
+
+def _patchify_image(
+    data: bytes,
+    patch_width: int,
+    patch_height: int,
+) -> Tuple[List[bytes], int, int]:
+    """Split one image into raster-ordered, header-free BMP pixel arrays.
+
+    The image is padded on the right/bottom to a multiple of the requested
+    rectangle; each patch uses BMP's BGR/bottom-up/aligned-row layout but
+    contains no BMP or DIB header. Returns
+    ``(patch_datas, orig_width, orig_height)``.
+    """
+    with Image.open(io.BytesIO(data)) as source:
+        image = source.convert("RGB")
+    orig_width, orig_height = image.size
+
+    if patch_width <= 0 or patch_height <= 0:
+        raise ValueError(
+            "image patch dimensions must be positive, got "
+            f"{patch_width}x{patch_height}")
+
+    padded_width = (
+        (orig_width + patch_width - 1) // patch_width) * patch_width
+    padded_height = (
+        (orig_height + patch_height - 1) // patch_height) * patch_height
+
+    padded = Image.new("RGB", (padded_width, padded_height))
+    padded.paste(image, (0, 0))
+
+    patch_datas: List[bytes] = []
+    for y in range(0, padded_height, patch_height):
+        for x in range(0, padded_width, patch_width):
+            patch = padded.crop(
+                (x, y, x + patch_width, y + patch_height))
+            patch_datas.append(_pil_to_bmp_payload(patch))
+    return patch_datas, orig_width, orig_height
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-def patchify_image(
-    data: Any,
-    patch_size: int = 32,
-    mode: str = "RGB",
-) -> Tuple[List[ImagePatch], ImagePatchMeta]:
-    """Convert an image row to fixed-size BMP patches.
-
-    The image is padded on the right/bottom to a multiple of patch_size.
-    Reassembly crops back to the original dimensions.
-    """
-    image = _image_to_pil(data).convert(mode)
-    original_width, original_height = image.size
-
-    padded_width = ((original_width + patch_size - 1) //
-                    patch_size) * patch_size
-    padded_height = ((original_height + patch_size - 1) //
-                     patch_size) * patch_size
-
-    padded = Image.new(mode, (padded_width, padded_height))
-    padded.paste(image, (0, 0))
-
-    patches: List[ImagePatch] = []
-    idx = 0
-    for y in range(0, padded_height, patch_size):
-        for x in range(0, padded_width, patch_size):
-            patch = padded.crop((x, y, x + patch_size, y + patch_size))
-            patches.append(ImagePatch(
-                index=idx, x=x, y=y,
-                width=patch_size, height=patch_size,
-                data=_pil_to_bmp_bytes(patch),
-            ))
-            idx += 1
-
-    meta = ImagePatchMeta(
-        original_width=original_width,
-        original_height=original_height,
-        padded_width=padded_width,
-        padded_height=padded_height,
-        patch_size=patch_size,
-        mode=mode,
-    )
-    return patches, meta
-
-
 def patchify_images_for_compression(
-    bmp_files: List[str],
+    image_files: List[str],
     indices: List[int],
-    patch_size: int = 32,
+    patch_width: int,
+    patch_height: int,
 ) -> List[ImagePatchRecord]:
     """Patchify all images in a worker shard into a flat list of ImagePatchRecords.
 
-    Pure preprocessing step — no compression logic involved.
-    Mirrors chunk_documents_for_compression in text_utils.
+    Pure preprocessing step — no compression logic involved. The 2D counterpart
+    of ``chunk_audio_for_compression``: yields BMP-compatible pixel payloads
+    without repeating a BMP header for every patch. The dimensions are explicit
+    because RAC payloads may be rectangular rather than square.
     """
     all_records: List[ImagePatchRecord] = []
     for local_idx, i in enumerate(indices):
-        with open(bmp_files[i], "rb") as f:
-            patches, meta = patchify_image(f.read(), patch_size=patch_size)
-        for p in patches:
+        with open(image_files[i], "rb") as f:
+            patch_datas, orig_w, orig_h = _patchify_image(
+                f.read(), patch_width, patch_height)
+        for patch_idx, data in enumerate(patch_datas):
             all_records.append(ImagePatchRecord(
-                patch=p, sample_idx=local_idx, meta=meta))
+                data=data, sample_idx=local_idx, patch_idx=patch_idx,
+                orig_width=orig_w, orig_height=orig_h,
+                patch_width=patch_width, patch_height=patch_height))
     return all_records
 
 
 def reassemble_image_patches(
-    patches: Sequence[ImagePatch],
-    meta: ImagePatchMeta,
+    patch_datas: Sequence[bytes],
+    orig_width: int,
+    orig_height: int,
+    patch_width: int,
+    patch_height: int,
 ) -> Image.Image:
-    """Reassemble decoded BMP patch bytes back into a PIL image."""
-    canvas = Image.new(meta.mode, (meta.padded_width, meta.padded_height))
-    for patch in sorted(patches, key=lambda p: p.index):
-        canvas.paste(_bmp_bytes_to_pil(patch.data).convert(
-            meta.mode), (patch.x, patch.y))
-    return canvas.crop((0, 0, meta.original_width, meta.original_height))
+    """Rebuild a PIL image from raster-ordered BMP pixel payloads.
+
+    The 2D analog of ``pcm_payload_to_wav`` — re-wraps header-free payload back
+    into a viewable form. ``patch_datas`` must be the image's whole patch set in
+    raster order; each patch's x/y is derived from its position.
+    """
+    if patch_width <= 0 or patch_height <= 0:
+        raise ValueError(
+            "image patch dimensions must be positive, got "
+            f"{patch_width}x{patch_height}")
+    padded_width = (
+        (orig_width + patch_width - 1) // patch_width) * patch_width
+    per_row = padded_width // patch_width
+    padded_height = (
+        (orig_height + patch_height - 1) // patch_height) * patch_height
+    expected_patches = per_row * (padded_height // patch_height)
+    if len(patch_datas) != expected_patches:
+        raise ValueError(
+            f"got {len(patch_datas)} patches, expected {expected_patches} for "
+            f"a padded {padded_width}x{padded_height} image with "
+            f"{patch_width}x{patch_height} patches")
+
+    canvas = Image.new("RGB", (padded_width, padded_height))
+    for patch_idx, data in enumerate(patch_datas):
+        x = (patch_idx % per_row) * patch_width
+        y = (patch_idx // per_row) * patch_height
+        canvas.paste(
+            _bmp_payload_to_pil(data, patch_width, patch_height), (x, y))
+    return canvas.crop((0, 0, orig_width, orig_height))

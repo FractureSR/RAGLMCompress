@@ -17,8 +17,6 @@ They are normalised internally before passing to constriction.
 """
 from __future__ import annotations
 
-from typing import List
-
 import numpy as np
 import constriction
 

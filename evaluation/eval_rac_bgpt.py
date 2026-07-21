@@ -8,19 +8,17 @@ units, retrieves top-m similar base chunks per unit, and runs
 beats its transmitted-id cost, else no condition). The chosen base ids travel as
 side info; their bit cost is added for honest bpb/ratio, just like the text eval.
 
-Payload vs condition size (the text analogy): as in ``eval_rac_llm.py`` — where
-the data piece is ``ctx_len - max_ctx`` LM tokens while conditions keep the
-database ``chunk_size`` — the audio payload window defaults to the byte context
-left after the prefix budget (override with ``--audio-chunk-bytes``), while each
-retrieved condition stays one database chunk. Retrieval queries with the whole
-payload; the chosen conditions are prepended as byte prefixes and the combined
-sequence is patchified/padded to bGPT's format by the compressor. Image payloads
-remain single database-sized patches (a 2D unit has no window to grow).
+Payload plus the maximum condition budget is fixed to the training-sized media
+body: 8000 bytes for audio and 3072 bytes for image. Image payload patches may
+be rectangular; their width/height are resolved against the remaining exact BMP
+pixel-payload budget. The compressor prepends a free modality header, then the
+actual chosen conditions, then the payload. Missing conditions are never padded.
 
 Usage
 -----
     python evaluation/eval_rac_bgpt.py --database results/rac_img_db \\
         --model pretrained/bgpt/weights-image.pth --m 16 --n-samples 50 \\
+        --image-payload-width 32 --image-payload-height 24 \\
         --device cuda:0
 """
 from __future__ import annotations
@@ -41,11 +39,18 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from compression.bgpt_compressor import BGPTCompressor
+from compression.bgpt_compressor import (
+    AUDIO_BODY_BYTES,
+    IMAGE_BODY_BYTES,
+    BGPTCompressor,
+    free_context_header,
+)
 from compression.rac_bgpt_compressor import RACBGPTCompressor
 from compression.rac_index import CalibratedIndexCoder, FixedIndexCoder, load_index_coder
 from utils.bgpt_codec_utils import (
-    bytes_to_padded_tokens, make_bgpt_retriever, pad_input_for_bgpt,
+    RAC_BGPT_DB_FORMAT_VERSION,
+    make_bgpt_retriever,
+    pad_input_for_bgpt,
 )
 from utils.eval_utils import (
     EvalResult, EvalStats,
@@ -81,11 +86,18 @@ def _load_model(checkpoint_path: str, device: torch.device) -> bGPTLMHeadModel:
     return m.to(device).eval()
 
 
-def _load_database(database_dir: str, signals: str, kgram: int, patch_size: int):
+def _load_database(database_dir: str, signals: str, kgram: int):
     """Load the base chunks (→ base_tokens) and the byte retriever."""
     with open(os.path.join(database_dir, "base_chunks.pkl"), "rb") as f:
         base = pickle.load(f)
-    base_tokens = [bytes_to_padded_tokens(b["data"], patch_size) for b in base]
+    base_tokens = []
+    for chunk_idx, chunk in enumerate(base):
+        data = chunk["data"]
+        if not isinstance(data, bytes):
+            raise TypeError(
+                f"base chunk {chunk_idx} must contain bytes, got "
+                f"{type(data)!r}; rebuild the database")
+        base_tokens.append(list(data))
     if not base_tokens:
         raise ValueError(f"No base chunks found in {database_dir}/base_chunks.pkl")
     retriever = make_bgpt_retriever(signals=signals, kgram=kgram)
@@ -107,15 +119,19 @@ def _load_samples(modality: str, path: str, n: Optional[int]):
 def _chunk_eval_samples(modality: str, samples, indices: List[int], unit: dict):
     """Chunk a shard of eval samples into (data, ext, sample_local_idx) byte units.
 
-    ``unit`` sizes the eval-side payload window: for image it is the database
-    patch size, for audio it is the (decoupled, usually much larger) payload
-    byte window computed in ``main``. sample_local_idx indexes into ``indices``
-    (the shard), for per-sample rollup.
+    ``unit`` sizes the eval-side payload window independently from the database
+    condition unit. sample_local_idx indexes into ``indices`` (the shard), for
+    per-sample rollup.
     """
     if modality == "image":
         from utils.img_utils import patchify_images_for_compression
-        recs = patchify_images_for_compression(samples, indices, patch_size=unit["patch_px"])
-        return [(r.patch.data, "bmp", r.sample_idx) for r in recs]
+        recs = patchify_images_for_compression(
+            samples,
+            indices,
+            patch_width=unit["patch_width"],
+            patch_height=unit["patch_height"],
+        )
+        return [(r.data, "bmp", r.sample_idx) for r in recs]
     elif modality == "audio":
         from utils.audio_utils import chunk_audio_for_compression
         recs = chunk_audio_for_compression(
@@ -131,11 +147,11 @@ def _prefix_metrics(sample_data: List[tuple]) -> dict:
     gain_counts: Dict[int, int] = defaultdict(int)
 
     for cd, *_ in sample_data:
-        n_prefix = len(cd.metadata.get("ctx_ids", []))
+        n_prefix = len(cd.metadata["ctx_ids"])
         hist[n_prefix] += 1
-        gains = cd.metadata.get("ctx_gain_bits", [])
-        net_gains = cd.metadata.get("ctx_net_gain_bits", [])
-        id_bits = cd.metadata.get("ctx_id_bits", [])
+        gains = cd.metadata["ctx_gain_bits"]
+        net_gains = cd.metadata["ctx_net_gain_bits"]
+        id_bits = cd.metadata["ctx_id_bits"]
         for pos, gain in enumerate(gains, start=1):
             gain_sums[pos] += float(gain)
             net_gain_sums[pos] += float(net_gains[pos - 1])
@@ -177,7 +193,7 @@ def _rac_worker(
 ) -> List[dict]:
     model = _load_model(model_path, device)
     bgpt = BGPTCompressor(model, patch_size=cfg["patch_size"], device=device)
-    base_tokens, retriever = _load_database(database_dir, signals, kgram, cfg["patch_size"])
+    base_tokens, retriever = _load_database(database_dir, signals, kgram)
 
     index_coder = load_index_coder(index_path) if index_path else FixedIndexCoder(len(base_tokens))
     rac = RACBGPTCompressor(
@@ -185,7 +201,7 @@ def _rac_worker(
         index_coder=index_coder,
         max_ctx=cfg["max_ctx"],
         margin_bits=cfg["margin_bits"],
-        batch_size=cfg["batch_size"] or 1,
+        batch_size=cfg["batch_size"],
         cascade=cfg["cascade"],
         cascade_max_cond=cfg["cascade_max_cond"],
         cascade_nll_thresh=cfg["cascade_nll_thresh"],
@@ -221,7 +237,11 @@ def _rac_worker(
         with torch.inference_mode():
             model(patches=padded["patches"], masks=padded["masks"])
 
-    score_lens = [cfg["payload_bytes"] + cfg["max_ctx"]]
+    score_lens = [
+        len(free_context_header(ext))
+        + cfg["payload_bytes"]
+        + cfg["max_ctx"]
+    ]
     score_batch_size = cfg["batch_size"] or auto_batch_size(
         _probe, device, score_lens, max_batch=256,
         n_samples=max(1, len(segments) * m), verbose=True,
@@ -319,12 +339,12 @@ def _calibrate(device, model_path, samples, calib_idx, database_dir, modality, u
     try:
         model = _load_model(model_path, device)
         bgpt = BGPTCompressor(model, patch_size=cfg["patch_size"], device=device)
-        base_tokens, retriever = _load_database(database_dir, signals, kgram, cfg["patch_size"])
+        base_tokens, retriever = _load_database(database_dir, signals, kgram)
         rac = RACBGPTCompressor(
             bgpt, base_tokens,
             max_ctx=cfg["max_ctx"],
             margin_bits=cfg["margin_bits"],
-            batch_size=cfg["batch_size"] or 1,
+            batch_size=cfg["batch_size"],
             cascade=cfg["cascade"],
             cascade_max_cond=cfg["cascade_max_cond"],
             cascade_nll_thresh=cfg["cascade_nll_thresh"],
@@ -356,7 +376,11 @@ def _calibrate(device, model_path, samples, calib_idx, database_dir, modality, u
             with torch.inference_mode():
                 model(patches=padded["patches"], masks=padded["masks"])
 
-        score_lens = [cfg["payload_bytes"] + cfg["max_ctx"]]
+        score_lens = [
+            len(free_context_header(ext))
+            + cfg["payload_bytes"]
+            + cfg["max_ctx"]
+        ]
         rac.batch_size = cfg["batch_size"] or auto_batch_size(
             _probe, device, score_lens, max_batch=256,
             n_samples=max(1, len(segments) * m), verbose=False,
@@ -416,12 +440,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--n-samples", type=int, default=None,
                    help="cap on eval samples (default: all held-out samples)")
     p.add_argument("--m", type=int, default=16, help="top-k candidates tried per unit")
-    p.add_argument("--audio-chunk-bytes", type=int, default=None,
-                   help=("audio payload bytes per compression unit (default: fill "
-                         "the byte context left after the prefix budget, the "
-                         "analog of eval_rac_llm's ctx_len - max_ctx)"))
-    p.add_argument("--max-ctx", type=int, default=None,
-                   help="total prefix byte-token budget (default: chunk_size * max conditions)")
+    p.add_argument("--image-payload-width", type=int, default=None,
+                   help="Image payload patch width (required for image)")
+    p.add_argument("--image-payload-height", type=int, default=None,
+                   help="Image payload patch height (required for image)")
     p.add_argument("--margin-bits", type=float, default=0.0)
     p.add_argument("--batch-size", type=int, default=None,
                    help="candidates scored per bGPT forward (default: auto-probe)")
@@ -451,32 +473,80 @@ def main() -> None:
 
     with open(os.path.join(args.database, "meta.json")) as f:
         meta = json.load(f)
+    version = meta.get("format_version")
+    if version != RAC_BGPT_DB_FORMAT_VERSION:
+        raise ValueError(
+            f"unsupported bGPT RAC database format {version!r}; expected "
+            f"{RAC_BGPT_DB_FORMAT_VERSION}. Rebuild it with "
+            "utils/prepare_rac_data_bgpt.py")
 
     modality = meta["modality"]
-    unit = meta["unit"]
+    if modality not in {"audio", "image"}:
+        raise ValueError(f"unsupported bGPT RAC modality {modality!r}")
+    expected_payload_format = {
+        "audio": "pcm_u8",
+        "image": "bmp_rgb24_pixel_array",
+    }[modality]
+    if meta["payload_format"] != expected_payload_format:
+        raise ValueError(
+            f"database payload format {meta['payload_format']!r} does not match "
+            f"{modality} protocol {expected_payload_format!r}")
+    expected_ext = "wav" if modality == "audio" else "bmp"
+    if meta["ext"] != expected_ext:
+        raise ValueError(
+            f"database extension {meta['ext']!r} does not match modality "
+            f"{modality!r}")
     patch_size = meta["patch_size"]
-    chunk_size = meta["chunk_size"]            # condition token length (multiple of patch_size)
+    if patch_size != PATCH_SIZE:
+        raise ValueError(
+            f"database patch size {patch_size} does not match bGPT patch size "
+            f"{PATCH_SIZE}; rebuild the database")
+    chunk_size = meta["chunk_size"]            # raw bytes per condition
+    if meta["unit_bytes"] != chunk_size:
+        raise ValueError(
+            "database contains padded or variable-size condition tokens; "
+            "rebuild it with the raw-payload preparation pipeline")
     max_cond = args.cascade_max_cond if args.cascade else 1
-    max_ctx = args.max_ctx if args.max_ctx is not None else chunk_size * max_cond
+    if max_cond <= 0:
+        raise ValueError("--cascade-max-cond must be positive")
+    max_ctx = chunk_size * max_cond
 
-    # Payload window, decoupled from the condition size (the text analogy:
-    # eval_rac_llm's data piece is ctx_len - max_ctx while conditions keep the
-    # database chunk_size). byte_ctx is the byte budget once the ext and
-    # trailing pad patches are set aside; prefix + payload must fit in it.
-    # (Both get patch-padded, but max_ctx and byte_ctx are patch multiples, so
-    # the byte-level check is exact.)
-    byte_ctx = (PATCH_LENGTH - 2) * patch_size
+    # Condition + payload occupies exactly one training-sized media body at the
+    # maximum condition count. If the oracle chooses fewer conditions, the
+    # sequence is shorter; no placeholder bytes are inserted.
+    body_bytes = AUDIO_BODY_BYTES if modality == "audio" else IMAGE_BODY_BYTES
+    payload_bytes = body_bytes - max_ctx
+    if payload_bytes <= 0:
+        raise ValueError(
+            f"condition budget {max_ctx} B leaves no payload in the "
+            f"{body_bytes} B {modality} body")
+
     if modality == "audio":
-        payload_bytes = args.audio_chunk_bytes or byte_ctx - max_ctx
         unit = {"audio_chunk_bytes": payload_bytes}
     else:
-        payload_bytes = chunk_size
-    if payload_bytes <= 0 or payload_bytes + max_ctx > byte_ctx:
+        if (args.image_payload_width is None
+                or args.image_payload_height is None):
+            raise ValueError(
+                "image RAC evaluation requires --image-payload-width and "
+                "--image-payload-height")
+        from utils.img_utils import validate_bmp_patch_shape
+        payload_width, payload_height = validate_bmp_patch_shape(
+            payload_bytes,
+            width=args.image_payload_width,
+            height=args.image_payload_height,
+        )
+        unit = {
+            "patch_width": payload_width,
+            "patch_height": payload_height,
+        }
+
+    model_content_bytes = (
+        len(free_context_header(meta["ext"])) + max_ctx + payload_bytes)
+    byte_ctx = (PATCH_LENGTH - 2) * patch_size
+    if model_content_bytes > byte_ctx:
         raise ValueError(
-            f"payload {payload_bytes} B + prefix budget {max_ctx} B exceeds the "
-            f"bGPT byte context {byte_ctx} B ({PATCH_LENGTH} patches minus ext "
-            f"and trailing pad). Lower --audio-chunk-bytes / --cascade-max-cond, "
-            f"or rebuild the database with smaller units.")
+            f"free header + condition + payload needs {model_content_bytes} B, "
+            f"but bGPT has {byte_ctx} content bytes")
 
     # Eval set = the held-out samples persisted by prepare_rac_data_bgpt
     # (self-contained, no re-load/complement), or a fresh --dataset override.
@@ -498,8 +568,12 @@ def main() -> None:
         calib_idx = []
         test_idx = all_idx
     source = eval_path
+    shape_text = (
+        f" ({unit['patch_width']}x{unit['patch_height']})"
+        if modality == "image" else ""
+    )
     print(f"Loaded {len(samples)} held-out {modality} samples from {source} | "
-          f"eval {len(test_idx)} | payload {payload_bytes} B | condition "
+          f"eval {len(test_idx)} | payload {payload_bytes} B{shape_text} | condition "
           f"{chunk_size} tok x {max_cond} (prefix budget {max_ctx}) | "
           f"m {args.m} | devices: {devices}")
 

@@ -3,7 +3,7 @@
 Provides:
   EvalResult   — per-sample metrics dataclass
   EvalStats    — running aggregate
-  MemoryTracker — context manager for peak GPU + RAM
+  MemoryTracker — context manager for peak CUDA allocation + process RSS
   save_csv     — write results to CSV
   save_compressed / save_decompressed — persist artifacts
   parse_devices — "cuda:0,cuda:1" → list[torch.device]
@@ -14,7 +14,6 @@ from __future__ import annotations
 import csv
 import os
 import pickle
-import time
 from dataclasses import dataclass, asdict
 from typing import Any, Callable, Dict, List, Optional
 
@@ -41,7 +40,7 @@ class EvalResult:
     compress_s:       float   # wall time for compression
     decompress_s:     float   # wall time for decompression (-1 = skipped)
     peak_gpu_mb:      float   # peak GPU memory during sample (-1 = CPU)
-    # peak RSS memory during sample (-1 = unavailable)
+    # process RSS after sample (-1 = unavailable)
     peak_ram_mb:      float
     roundtrip_ok:     int     # 1=pass, 0=fail, -1=skipped
 
@@ -96,7 +95,7 @@ class EvalStats:
 # ---------------------------------------------------------------------------
 
 class MemoryTracker:
-    """Context manager that records peak GPU and CPU-RSS memory during a block."""
+    """Record peak CUDA allocation and process RSS around a block."""
 
     def __init__(self, device: torch.device):
         self.device = device
@@ -106,6 +105,7 @@ class MemoryTracker:
     def __enter__(self) -> "MemoryTracker":
         if self.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(self.device)
+        if _HAVE_PSUTIL:
             self._proc = _psutil.Process(os.getpid())
         return self
 
@@ -113,6 +113,7 @@ class MemoryTracker:
         if self.device.type == "cuda":
             self.peak_gpu_mb = torch.cuda.max_memory_allocated(
                 self.device) / 2**20
+        if _HAVE_PSUTIL:
             self.peak_ram_mb = self._proc.memory_info().rss / 2**20
 
 
@@ -143,10 +144,6 @@ def save_decompressed(data: bytes, out_dir: str, sample_id: str, ext: str) -> No
     with open(os.path.join(out_dir, f"{sample_id}.{ext}"), "wb") as f:
         f.write(data)
 
-
-# ---------------------------------------------------------------------------
-# Device helpers
-# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Batch size auto-selection
@@ -193,16 +190,19 @@ def auto_batch_size(
     stats = length_stats(lengths)
     n_cap = n_samples if n_samples is not None else stats["n"]
 
-    total_mem = torch.cuda.get_device_properties(device).total_memory
-    alloc_mem = torch.cuda.memory_allocated(device)
-    free_mem = total_mem - alloc_mem
+    # Driver-level free memory, not total - memory_allocated(): the latter sees
+    # only this process's PyTorch tensors, so on a shared GPU it is blind to
+    # other jobs (and to this process's CUDA context + reserved-but-unallocated
+    # memory), over-estimates free space, and picks a batch size that OOMs.
+    model_mem = torch.cuda.memory_allocated(device)
+    free_mem, total_mem = torch.cuda.mem_get_info(device)
 
     rep_len = stats["max"]
 
     if verbose:
         print(f"\n  [auto_batch_size]  GPU: {total_mem/2**20:.0f} MB total"
-              f", {alloc_mem/2**20:.0f} MB used by model"
-              f", {free_mem/2**20:.0f} MB free")
+              f", {model_mem/2**20:.0f} MB used by model"
+              f", {free_mem/2**20:.0f} MB free (driver, all processes)")
         print(f"  Length distribution (n={stats['n']}): "
               f"p50={stats['p50']}  p90={stats['p90']}  "
               f"p95={stats['p95']}  p99={stats['p99']}  "
@@ -244,6 +244,10 @@ def auto_batch_size(
 
     return batch_size
 
+
+# ---------------------------------------------------------------------------
+# Device helpers
+# ---------------------------------------------------------------------------
 
 def parse_devices(device_str: str) -> List[torch.device]:
     """'cuda:0,cuda:1' → [device('cuda:0'), device('cuda:1')]"""

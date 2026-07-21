@@ -39,7 +39,7 @@ class _Piece:
 
 
 class RACLLMCompressor:
-    """Select retrieved token prefixes by exact LM code length, then encode."""
+    """Select retrieved token prefixes by ideal LM code length, then encode."""
 
     def __init__(
         self,
@@ -68,9 +68,14 @@ class RACLLMCompressor:
         self.index_coder = index_coder or FixedIndexCoder(len(base_tokens))
         self.max_ctx = max_ctx
         self.margin_bits = margin_bits
-        self.batch_size = max(1, batch_size or 1)
+        if batch_size is not None and batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+        self.batch_size = 1 if batch_size is None else batch_size
         self.cascade = cascade
-        self.cascade_max_cond = max(1, cascade_max_cond)
+        if cascade_max_cond <= 0:
+            raise ValueError(
+                f"cascade_max_cond must be positive, got {cascade_max_cond}")
+        self.cascade_max_cond = cascade_max_cond
         self.cascade_nll_thresh = cascade_nll_thresh
         self.cascade_min_frac = cascade_min_frac
         self.cascade_top_k = cascade_top_k
@@ -83,13 +88,14 @@ class RACLLMCompressor:
         # ``_build_prefix`` would silently truncate later conditions to nothing
         # (they'd yield zero gain and be rejected after a wasted forward pass).
         if chunk_size is not None:
-            assert max_ctx == chunk_size * self.max_cond, (
-                f"max_ctx ({max_ctx}) must equal chunk_size ({chunk_size}) * "
-                f"max_cond ({self.max_cond}) = {chunk_size * self.max_cond} so "
-                f"every retrieved condition fits the prefix budget without "
-                f"truncation. Set --max-ctx accordingly (or lower "
-                f"--cascade-max-cond / --chunk-size)."
-            )
+            if max_ctx != chunk_size * self.max_cond:
+                raise ValueError(
+                    f"max_ctx ({max_ctx}) must equal chunk_size ({chunk_size}) * "
+                    f"max_cond ({self.max_cond}) = "
+                    f"{chunk_size * self.max_cond} so every retrieved condition "
+                    "fits the prefix budget without truncation. Lower "
+                    "--cascade-max-cond or rebuild the database with a smaller "
+                    "--chunk-size.")
 
     def _pbar(self, total: int, desc: str):
         """A per-device tqdm over model-forward sequences, or None if disabled."""
@@ -107,6 +113,10 @@ class RACLLMCompressor:
         data_token_lists: List[List[int]],
         cand_ids_lists: Sequence[Sequence[int]],
     ) -> List[CompressedData]:
+        if len(cand_ids_lists) != len(data_token_lists):
+            raise ValueError(
+                f"got {len(cand_ids_lists)} candidate lists for "
+                f"{len(data_token_lists)} payloads")
         if not data_token_lists:
             return []
 
@@ -149,7 +159,10 @@ class RACLLMCompressor:
         out: List[Optional[torch.Tensor]] = [None] * len(compressed_list)
         by_plen: Dict[int, list] = defaultdict(list)
         for i, cd in enumerate(compressed_list):
-            prefix = self._build_prefix(cd.metadata.get("ctx_ids", []))
+            if "ctx_ids" not in cd.metadata:
+                raise ValueError(
+                    f"compressed sample {i} has no RAC condition metadata")
+            prefix = self._build_prefix(cd.metadata["ctx_ids"])
             by_plen[len(prefix)].append((i, cd, prefix))
 
         pbar = self._pbar(len(compressed_list), "RAC decompress")

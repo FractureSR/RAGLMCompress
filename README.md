@@ -2,8 +2,8 @@
 
 Large-model-powered compression experiments for text, RAG-conditioned text,
 images, and audio. Every compressor turns a frozen model's next-symbol
-distribution into an arithmetic code, so the compressed size is the model's
-exact code length for the data.
+distribution into an arithmetic code. Evaluations report the emitted coder
+bytes and, for RAC, the transmitted condition-id cost.
 
 ## Project Layout
 
@@ -12,18 +12,19 @@ exact code length for the data.
     `PromptContext` prepends conditioning tokens before the data; the coder
     skips those prefix positions.
   - `BGPTCompressor`: byte-level compression with bGPT. An optional per-segment
-    `prefixes` (whole retrieved base patches) prepends conditioning **bytes**
-    before the payload and the coder skips them — the byte-domain analog of
-    `LLMCompressor`'s `PromptContext`.
+    `prefixes` prepends raw conditioning **bytes** before the payload. A fixed
+    decoder-known WAV/BMP header and these conditions are model context only;
+    the coder skips them — the byte-domain analog of `LLMCompressor`'s
+    `PromptContext`.
   - `RACLLMCompressor` (`rac_llm_compressor.py`): retrieval-augmented compression
     — prepends the **raw tokens** of retrieved base chunks as the LM prefix and
-    keeps the **oracle** choice (best of top-k by exact code length), or no
+    keeps the **oracle** choice (best of top-k by ideal model code length), or no
     condition if none beats its side-info cost. No training.
   - `RACBGPTCompressor` (`rac_bgpt_compressor.py`): the byte-domain analog of
     `RACLLMCompressor` — the same oracle-RAC over `BGPTCompressor`'s `prefixes`
     path instead of `LLMCompressor`'s token prompt (`RACBGPTCompressor` :
     `BGPTCompressor` :: `RACLLMCompressor` : `LLMCompressor`). Conditions are whole
-    retrieved base patches (raw bytes).
+    retrieved base byte chunks.
   - `rac_index.py`: index side-info coders (`FixedIndexCoder`,
     `CalibratedIndexCoder`) that price the transmitted base-chunk ids.
   - `base_compressor.py` / `types.py`: shared arithmetic-coding kernels and
@@ -42,8 +43,8 @@ exact code length for the data.
 Compress data by conditioning the frozen LM on the raw tokens of similar chunks
 retrieved from a base corpus **using the data itself**. RAC ≠ RAG: we already
 have the data `x`, retrieve with `x`, and re-encode `x` more cheaply. Because we
-are compressing we can *measure* each candidate's exact effect on the code length
-and keep the **oracle** (best of top-k) — or no condition if none beats its
+are compressing we can score each candidate under the same frozen model and keep
+the **oracle** (best of top-k by summed NLL) — or no condition if none beats its
 side-info cost. No training.
 
 The same pipeline exists for **text** (LLM tokens) and **bytes** (audio/image on
@@ -73,45 +74,65 @@ python evaluation/eval_rac_llm.py --database results/rac_c_db \
 Pipeline (bytes) — identical shape, over image patches / audio chunks. The base
 corpus is chunked into fixed-size **byte** units, indexed by byte-k-gram BM25
 (`make_bgpt_retriever`); the eval chunks + retrieves the held-out samples live
-(mirrors `eval_bgpt`). Keep `chunk_patches * (max_cond + 1) + 2 ≤ 512` (the
-patch-decoder context) — pick `--patch-px` / `--chunk-ms` accordingly.
+(mirrors `eval_bgpt`). bGPT receives a canonical decoder-known WAV/BMP header as
+free model context, but the header is neither stored nor measured. Only payload
+bytes are coded. Baseline payloads are 8000 B (audio) or 3072 B (image); RAC
+reserves condition bytes inside that same body budget and does not pad missing
+conditions.
 
 Audio input is standardized before prepare/evaluation: dataset download scripts
-must export uncompressed 8 kHz, mono, 8-bit PCM WAV files. For People's Speech
-microset, each WAV is validated and then split into header-free PCM_U8 payloads:
+must export uncompressed mono, 8-bit PCM WAV files while preserving the source
+sample rate. Each WAV is validated and split into header-free PCM_U8 payloads by
+byte count:
 
 ```
-python scripts/download_peoples_speech_microset.py \
-    --output datasets/peoples_speech_microset_wav
+python scripts/download_ljspeech_data.py \
+    --output datasets/ljspeech_wav --limit-mb 64
 
 python utils/prepare_rac_data_bgpt.py \
-    --dataset datasets/peoples_speech_microset_wav --modality audio \
-    --n-samples 200 --base-frac 0.5 --chunk-ms 250 --patch-size 16 \
+    --dataset datasets/ljspeech_wav --modality audio \
+    --n-samples 200 --base-frac 0.5 --audio-chunk-bytes 512 \
     --out results/rac_audio_db
 ```
+
+The free WAV context is the checkpoint's fixed 44-byte 8 kHz training header;
+it does not resample the native-rate PCM or become part of the output. A
+decompressed payload is wrapped with its source sample rate when saved as WAV.
 
 ```
 # 1. Build the byte retrieval database (image example).
 python utils/prepare_rac_data_bgpt.py \
     --dataset datasets/clic2024/bmp --modality image --n-samples 400 \
-    --base-frac 0.5 --patch-px 16 --patch-size 16 --out results/rac_img_db
+    --base-frac 0.5 --image-patch-width 16 --image-patch-height 16 \
+    --out results/rac_img_db
 
 # 2. Evaluate oracle RAC over bGPT on the held-out samples the DB persisted.
 python evaluation/eval_rac_bgpt.py --database results/rac_img_db \
-    --model pretrained/bgpt/weights-image.pth --m 16 --device cuda:0
+    --model pretrained/bgpt/weights-image.pth --m 16 \
+    --image-payload-width 32 --image-payload-height 24 --device cuda:0
 ```
+
+For image databases, `eval_samples.pkl` stores held-out source paths rather than
+duplicating image files, so the source dataset must remain at those paths.
+bGPT RAC databases are format-versioned; rebuild an older database when eval
+reports a schema mismatch rather than mixing header-bearing and raw chunks.
 
 The chosen base ids are transmitted as side information (the decoder can't re-run
 retrieval — the query is the unknown data); their bit cost (fixed, or a static
 table built with `--calibrate`) is charged for honest bpb/ratio.
 
-**Prefix budget.** Each condition is one full base chunk of `chunk_size` tokens
-(bytes: a whole base patch, a multiple of `patch_size`), and at most `max_cond`
-conditions are prepended per piece (`max_cond` = number of `--cascade` levels, or
-1 when cascade is off). The prefix budget therefore satisfies
-`max_ctx == chunk_size * max_cond`, which the eval derives by default and the RAC
-compressor asserts — this guarantees no condition is silently truncated. Pass
-`--max-ctx` only to override it (it is validated against the same invariant).
+**Prefix budget.** Each condition is one full base chunk of `chunk_size` raw
+bytes, and at most `max_cond` conditions are prepended per piece (`max_cond` =
+`--cascade-max-cond` when cascade is enabled, or 1 otherwise). Evaluation sets
+`max_ctx = chunk_size * max_cond`, and the RAC compressor asserts the same
+invariant so no condition is silently truncated.
+
+**Image shapes.** `--image-patch-width/height` on database preparation define
+the retrieved condition shape. RAC evaluation requires both
+`--image-payload-width` and `--image-payload-height`; baseline evaluation likewise
+requires both `--image-patch-width` and `--image-patch-height`. The pipeline only
+validates the supplied rectangle against BMP row alignment and the exact byte
+budget. It never infers either dimension.
 
 The retriever (`utils/rag_utils.py`) and the index coders
 (`compression/rac_index.py`) are modality-agnostic and shared as-is between the

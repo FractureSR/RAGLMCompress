@@ -127,7 +127,7 @@ class LLMCompressor(BaseCompressor):
         The score-only counterpart of :meth:`compress_batch`: it shares
         :meth:`_prefill`, so each ``LMScore.bits`` equals the data code length the
         coder would emit (up to the few bytes of range-coder overhead). Use it to
-        *rank* prompt contexts by exact code length (RAC's oracle) and to inspect
+        rank prompt contexts by ideal model code length (RAC's oracle) and inspect
         per-token surprise (RAC's cascade) without paying for the range coder.
         """
         seq_lens: List[int] = attention_mask.sum(dim=1).long().tolist()

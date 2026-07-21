@@ -7,9 +7,8 @@ ranking over the base.  Multiple scorer rankings are fused with Reciprocal Rank
 Fusion (RRF).
 
 A concrete modality wires this up by supplying scorers built from its own
-featurisers (see ``utils/text_utils.py`` for the text instantiation: a BM25
-lexical scorer + a Qwen3-Embedding dense scorer).  Audio/image will register
-their own scorers from ``audio_utils`` / ``img_utils`` without touching this file.
+featurisers. See ``utils/text_utils.py`` for text BM25/dense retrieval and
+``utils/bgpt_codec_utils.py`` for byte-k-gram BM25 over audio/image chunks.
 
 Typical use
 -----------
@@ -224,6 +223,19 @@ class Retriever:
     def load(self, dirpath: str) -> None:
         with open(os.path.join(dirpath, "items.pkl"), "rb") as f:
             self.items = pickle.load(f)
+        with open(os.path.join(dirpath, "retriever.json")) as f:
+            meta = json.load(f)
+        scorer_names = [scorer.name for scorer in self.scorers]
+        if meta["scorers"] != scorer_names:
+            raise ValueError(
+                f"retriever scorers {meta['scorers']} do not match "
+                f"configured scorers {scorer_names}")
+        if meta["n_items"] != len(self.items):
+            raise ValueError(
+                f"retriever metadata declares {meta['n_items']} items, "
+                f"but items.pkl contains {len(self.items)}")
+        self.rrf_k = meta["rrf_k"]
+        self.weights = meta["weights"]
         for s in self.scorers:
             s.load(dirpath)
 

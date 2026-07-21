@@ -103,10 +103,6 @@ def load_text_documents(
     return _find_text_loader(path)(path, num_documents, skip_documents)
 
 
-# Backward-compat alias
-load_text_documents_from_hf = load_text_documents
-
-
 # ---------------------------------------------------------------------------
 # Shared low-level helpers used by built-in loaders
 # ---------------------------------------------------------------------------

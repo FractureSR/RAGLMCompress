@@ -9,11 +9,11 @@ ones that separate ``BGPTCompressor`` from ``LLMCompressor``:
 
   - A data piece is a byte ``segment`` ``(payload_bytes, ext)`` rather than a
     list of LM token ids.
-  - The retrieved prefix is a run of **byte tokens** (whole base patches) passed
+  - The retrieved prefix is a run of raw **byte tokens** passed
     through ``BGPTCompressor``'s ``prefixes=`` path instead of a token
     ``PromptContext``.
-  - bGPT pads a batch itself (PAD_TOKEN), so there is no tokenizer / pad-id
-    bookkeeping.
+  - bGPT pads the combined header/condition/payload stream once at the end, so
+    there is no tokenizer bookkeeping.
   - The cascade query built from high-surprise residual is raw ``bytes`` (for a
     byte-domain retriever) instead of detokenised text.
 
@@ -31,7 +31,6 @@ import torch
 from compression.bgpt_compressor import BGPTCompressor
 from compression.rac_index import FixedIndexCoder
 from compression.types import CompressedData, LMScore
-from utils.bgpt_codec_utils import PAD_TOKEN, bytes_to_padded_tokens
 
 
 T = TypeVar("T")
@@ -54,7 +53,7 @@ class _Piece:
 
 
 class RACBGPTCompressor:
-    """Select retrieved byte prefixes by exact bGPT code length, then encode."""
+    """Select retrieved byte prefixes by ideal bGPT code length, then encode."""
 
     def __init__(
         self,
@@ -83,9 +82,14 @@ class RACBGPTCompressor:
         self.index_coder = index_coder or FixedIndexCoder(len(base_tokens))
         self.max_ctx = max_ctx
         self.margin_bits = margin_bits
-        self.batch_size = max(1, batch_size or 1)
+        if batch_size is not None and batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+        self.batch_size = 1 if batch_size is None else batch_size
         self.cascade = cascade
-        self.cascade_max_cond = max(1, cascade_max_cond)
+        if cascade_max_cond <= 0:
+            raise ValueError(
+                f"cascade_max_cond must be positive, got {cascade_max_cond}")
+        self.cascade_max_cond = cascade_max_cond
         self.cascade_nll_thresh = cascade_nll_thresh
         self.cascade_min_frac = cascade_min_frac
         self.cascade_top_k = cascade_top_k
@@ -93,28 +97,33 @@ class RACBGPTCompressor:
         # At most this many conditions are ever prepended per piece (one per
         # cascade level; exactly one when cascade is off).
         self.max_cond = self.cascade_max_cond if self.cascade else 1
-        # Each retrieved base chunk is a whole number of patches, so any prefix
-        # the oracle builds starts the payload on a patch boundary (BGPTCompressor
-        # asserts this). A chunk split mid-patch would misalign every later patch.
+        # Conditions are raw bytes. BGPTCompressor concatenates header,
+        # condition, and payload before doing one final model-only patch pad, so
+        # condition boundaries do not need to align with bGPT patches.
         for cid, chunk in enumerate(base_tokens):
-            assert chunk and len(chunk) % self.patch_size == 0, (
-                f"base chunk {cid} has length {len(chunk)}; every base chunk must "
-                f"be a positive multiple of patch_size ({self.patch_size})")
+            if not chunk:
+                raise ValueError(f"base chunk {cid} is empty")
+            invalid = next((token for token in chunk if not 0 <= token <= 255), None)
+            if invalid is not None:
+                raise ValueError(
+                    f"base chunk {cid} contains non-byte token {invalid}; "
+                    "rebuild the database without patch padding")
         # The prefix budget must fit every condition at full size, otherwise
         # ``_build_prefix`` would silently truncate later conditions (they'd yield
         # zero gain and be rejected after a wasted forward pass). Mirrors the text
         # RAC invariant ``max_ctx == chunk_size * max_cond``.
-        assert max_ctx % self.patch_size == 0, (
-            f"max_ctx ({max_ctx}) must be a multiple of patch_size "
-            f"({self.patch_size})")
         if chunk_size is not None:
-            assert max_ctx == chunk_size * self.max_cond, (
-                f"max_ctx ({max_ctx}) must equal chunk_size ({chunk_size}) * "
-                f"max_cond ({self.max_cond}) = {chunk_size * self.max_cond} so "
-                f"every retrieved condition fits the prefix budget without "
-                f"truncation. Set --max-ctx accordingly (or lower "
-                f"--cascade-max-cond / --chunk-size)."
-            )
+            if any(len(chunk) != chunk_size for chunk in base_tokens):
+                raise ValueError(
+                    f"all base chunks must contain exactly {chunk_size} raw bytes")
+            if max_ctx != chunk_size * self.max_cond:
+                raise ValueError(
+                    f"max_ctx ({max_ctx}) must equal chunk_size ({chunk_size}) * "
+                    f"max_cond ({self.max_cond}) = "
+                    f"{chunk_size * self.max_cond} so every retrieved condition "
+                    "fits the prefix budget without truncation. Lower "
+                    "--cascade-max-cond or rebuild the database with smaller "
+                    "condition units.")
 
     def _pbar(self, total: int, desc: str):
         """A per-device tqdm over model-forward sequences, or None if disabled."""
@@ -132,11 +141,15 @@ class RACBGPTCompressor:
         segments: List[Tuple[bytes, str]],
         cand_ids_lists: Sequence[Sequence[int]],
     ) -> List[CompressedData]:
+        if len(cand_ids_lists) != len(segments):
+            raise ValueError(
+                f"got {len(cand_ids_lists)} candidate lists for "
+                f"{len(segments)} payloads")
         if not segments:
             return []
 
         pieces = [
-            _Piece(idx=i, data=bytes(raw), ext=ext, pool=list(cands))
+            _Piece(idx=i, data=raw, ext=ext, pool=list(cands))
             for i, ((raw, ext), cands) in enumerate(zip(segments, cand_ids_lists))
         ]
 
@@ -174,7 +187,10 @@ class RACBGPTCompressor:
         out: List[Optional[bytes]] = [None] * len(compressed_list)
         by_plen: Dict[int, list] = defaultdict(list)
         for i, cd in enumerate(compressed_list):
-            prefix = self._build_prefix(cd.metadata.get("ctx_ids", []))
+            if "ctx_ids" not in cd.metadata:
+                raise ValueError(
+                    f"compressed sample {i} has no RAC condition metadata")
+            prefix = self._build_prefix(cd.metadata["ctx_ids"])
             by_plen[len(prefix)].append((i, cd, prefix))
 
         pbar = self._pbar(len(compressed_list), "RAC-bGPT decompress")
@@ -323,14 +339,14 @@ class RACBGPTCompressor:
         data: bytes,
         nll: torch.Tensor,
     ) -> Optional[bytes]:
-        tokens = bytes_to_padded_tokens(data, self.patch_size)
+        tokens = list(data)
         high = (nll > self.cascade_nll_thresh).cpu()
         if float(high.float().mean().item()) < self.cascade_min_frac:
             return None
 
         hi_bytes = bytes(
             tok for tok, is_high in zip(tokens, high.tolist())
-            if is_high and tok != PAD_TOKEN
+            if is_high
         )
         return hi_bytes if hi_bytes else b""
 
@@ -344,7 +360,7 @@ class RACBGPTCompressor:
             # Sort by (payload token length, idx) so decompress_batch can rebuild
             # the identical batches from CompressedData.original_length — bGPT's
             # decode must see each piece in the same batch it was coded in.
-            group.sort(key=lambda p: (len(bytes_to_padded_tokens(p.data, self.patch_size)), p.idx))
+            group.sort(key=lambda p: (len(p.data), p.idx))
             for start in range(0, len(group), self.batch_size):
                 batch = group[start:start + self.batch_size]
                 seg_batch = [(p.data, p.ext) for p in batch]

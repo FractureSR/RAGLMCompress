@@ -1,3 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
 python evaluation/eval_rac_llm.py \
     --database results/rac_arxiv_cl \
     --model pretrained/SmolLM2-135M \
@@ -8,6 +11,5 @@ python evaluation/eval_rac_llm.py \
     --cascade-retriever \
     --calibrate \
     --calib-docs 10 \
-    --device cuda:0 \
-    --max-tokens 8192 \
+    --device "${DEVICE:-cuda:0}" \
     --no-decompress

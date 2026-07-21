@@ -1,19 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
 # Image
-#python evaluation/eval_bgpt.py \
+# python evaluation/eval_bgpt.py \
 #    --modality image \
 #    --dataset  datasets/clic2024/bmp \
 #    --model    pretrained/bgpt/weights-image.pth \
 #    --n-samples 100 \
-#    --device cuda:0 \
+#    --image-patch-width 32 --image-patch-height 32 \
+#    --device "${DEVICE:-cuda:0}" \
 #    --output results/bgpt_image.csv
 
-# Audio
+# Audio baseline on the same held-out samples persisted by RAC preparation.
 python evaluation/eval_bgpt.py \
     --modality audio \
-    --dataset  results/rac_vtck_p225/eval_samples.pkl \
+    --dataset results/rac_vctk/eval_samples.pkl \
     --model    pretrained/bgpt/weights-audio.pth \
     --n-samples 50 \
-    --device cuda:3 \
-    --audio-chunk-bytes 8160 \
-    --no-decompress \
-    
+    --device "${DEVICE:-cuda:0}" \
+    --no-decompress

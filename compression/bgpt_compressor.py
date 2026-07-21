@@ -1,25 +1,15 @@
-"""BGPTCompressor: byte-level compression using the bGPT hierarchical model.
+"""Byte-level arithmetic compression with bGPT.
 
-Structurally mirrors LLMCompressor:  both use _encode_sequence and _decode_batch
-from BaseCompressor.  The only differences are:
-  - Input domain: raw bytes → byte tokens 0-255, with PAD=256.
-  - Model input: (patches, masks) tensors built by pad_input_for_bgpt.
-  - Logits shape: the bGPT output needs a reshape before use.
+For the audio and image checkpoints, bGPT was trained on complete WAV/BMP byte
+streams.  The public pipeline stores and measures only media payload bytes, so
+this compressor restores the familiar container header as *free context*:
 
-The padding trick is preserved identically: the decode loop pads the partial
-decoded token list to the original payload length before each forward pass,
-mirroring the prefill pass.
+    extension patch + header + optional RAC condition + payload
 
-Byte-prefix path (the byte-domain analog of LLMCompressor's ``PromptContext``):
-each method takes an optional ``prefixes`` — one list of prefix **byte tokens**
-per segment — prepended between the extension patch and the payload so the model
-conditions on them while the coder skips them.  This is what
-``RACBGPTCompressor`` prepends the raw bytes of retrieved base chunks through,
-exactly as ``RACLLMCompressor`` prepends retrieved token prefixes through
-``LLMCompressor``.  With ``prefixes=None`` the path is byte-identical to plain
-bGPT compression.  Every prefix in one batch must share a length that is a
-multiple of ``patch_size`` so the payload stays patch-aligned (whole retrieved
-patches, no truncation) and the ``logits.shape[0] // B`` reshape stays uniform.
+The header and condition are fed to bGPT but are never arithmetic-coded.  Only
+the original payload contributes to ``CompressedData.original_length`` and the
+reported compression ratio.  The combined stream is padded once, at its end,
+to satisfy bGPT's byte-patch layout.
 """
 from __future__ import annotations
 
@@ -31,138 +21,210 @@ import torch
 from compression.base_compressor import BaseCompressor
 from compression.types import CompressedData, LMScore
 from utils.bgpt_codec_utils import (
-    PAD_TOKEN, VOCAB_SIZE,
-    bytes_to_padded_tokens, extension_tokens,
-    pad_input_for_bgpt, tokens_to_bytes,
+    PAD_TOKEN,
+    VOCAB_SIZE,
+    extension_tokens,
+    pad_input_for_bgpt,
+    tokens_to_bytes,
 )
 
 
-# ---------------------------------------------------------------------------
-# Compressor
-# ---------------------------------------------------------------------------
+IMAGE_BODY_BYTES = 32 * 32 * 3
+AUDIO_BODY_BYTES = 8000
+
+
+# Canonical headers for the bGPT training-sized files. They are model-only
+# context, not part of the stored or measured byte stream. In particular, the
+# WAV header remains the checkpoint's 8 kHz template even though input clips
+# retain their native sample rate; only their header-free PCM payload is coded.
+_BMP_32X32_RGB24_HEADER = bytes.fromhex(
+    "424d360c00000000000036000000280000002000000020000000"
+    "0100180000000000000c0000c40e0000c40e00000000000000000000"
+)
+_WAV_8K_MONO_U8_8000_HEADER = bytes.fromhex(
+    "52494646641f000057415645666d74201000000001000100401f0000"
+    "401f00000100080064617461401f0000"
+)
+_FREE_CONTEXT_HEADERS = {
+    "bmp": _BMP_32X32_RGB24_HEADER,
+    "wav": _WAV_8K_MONO_U8_8000_HEADER,
+}
+
+
+def free_context_header(ext: str) -> bytes:
+    """Return fixed decoder-known model context for a bGPT modality."""
+    if not isinstance(ext, str):
+        raise TypeError(f"bGPT media extension must be str, got {type(ext)!r}")
+    key = ext.lower().lstrip(".")
+    try:
+        return _FREE_CONTEXT_HEADERS[key]
+    except KeyError as exc:
+        raise ValueError(
+            f"unsupported bGPT media extension {ext!r}; expected 'bmp' or 'wav'"
+        ) from exc
+
 
 class BGPTCompressor(BaseCompressor):
 
-    def __init__(self, model, patch_size: int = 16, device: Optional[torch.device] = None) -> None:
+    def __init__(self, model, patch_size: int = 16,
+                 device: Optional[torch.device] = None) -> None:
         self.model = model
         self.patch_size = patch_size
         self.device = device or next(model.parameters()).device
         self.model.eval()
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def _prefix_length(self, prefixes: Optional[Sequence[Sequence[int]]], B: int) -> int:
-        """Validate ``prefixes`` and return the shared prefix length (0 if none).
-
-        Every segment in a batch must carry the same prefix length (so the
-        ``pad_input_for_bgpt`` layout is uniform and ``logits.shape[0] // B`` is a
-        clean per-sample split), and that length must be a whole number of patches
-        (so the payload begins on a patch boundary and the retrieved prefix is
-        never split mid-patch). The byte-domain counterpart of
-        ``PromptContext.prefix_length()``.
-        """
+    def _normalise_prefixes(
+        self,
+        prefixes: Optional[Sequence[Sequence[int]]],
+        batch_size: int,
+    ) -> List[List[int]]:
         if prefixes is None:
-            return 0
-        assert len(prefixes) == B, (
-            f"got {len(prefixes)} prefixes for {B} segments")
-        lengths = {len(p) for p in prefixes}
-        assert len(lengths) == 1, (
-            f"all prefixes in a batch must share one length, got {sorted(lengths)}")
-        prefix_length = lengths.pop()
-        assert prefix_length % self.patch_size == 0, (
-            f"prefix length {prefix_length} must be a multiple of "
-            f"patch_size {self.patch_size} so the payload stays patch-aligned")
-        return prefix_length
+            return [[] for _ in range(batch_size)]
+        if len(prefixes) != batch_size:
+            raise ValueError(
+                f"got {len(prefixes)} prefixes for {batch_size} segments")
+
+        result: List[List[int]] = []
+        for sample_idx, prefix in enumerate(prefixes):
+            values = [int(token) for token in prefix]
+            invalid = next((token for token in values if not 0 <= token <= 255), None)
+            if invalid is not None:
+                raise ValueError(
+                    f"prefix {sample_idx} contains non-byte token {invalid}; "
+                    "RAC conditions must contain raw bytes, not PAD_TOKEN")
+            result.append(values)
+        return result
+
+    def _check_context_length(self, content_length: int) -> None:
+        total_patches = content_length // self.patch_size + 2
+        patch_decoder = getattr(self.model, "patch_level_decoder", None)
+        config = getattr(patch_decoder, "config", None)
+        limit = getattr(config, "max_position_embeddings", None)
+        if limit is not None and total_patches > limit:
+            raise ValueError(
+                f"bGPT input needs {total_patches} patches (including extension "
+                f"and end patches), but the model supports {limit}")
+
+    def _prepare_input(
+        self,
+        payloads: Sequence[Sequence[int]],
+        exts: Sequence[str],
+        prefixes: Optional[Sequence[Sequence[int]]] = None,
+    ) -> Tuple[dict, List[int]]:
+        """Build one uniformly padded batch and return payload byte offsets."""
+        batch_size = len(payloads)
+        prefix_list = self._normalise_prefixes(prefixes, batch_size)
+        if len(exts) != batch_size:
+            raise ValueError(f"got {len(exts)} extensions for {batch_size} payloads")
+
+        contents: List[List[int]] = []
+        payload_offsets: List[int] = []
+        for sample_idx, (payload, ext, prefix) in enumerate(
+                zip(payloads, exts, prefix_list)):
+            payload_tokens = [int(token) for token in payload]
+            invalid = next(
+                (token for token in payload_tokens if not 0 <= token <= PAD_TOKEN),
+                None,
+            )
+            if invalid is not None:
+                raise ValueError(
+                    f"payload {sample_idx} contains invalid bGPT token {invalid}")
+
+            header = list(free_context_header(ext))
+            payload_offsets.append(len(header) + len(prefix))
+            content = header + prefix + payload_tokens
+            remainder = len(content) % self.patch_size
+            if remainder:
+                content.extend([PAD_TOKEN] * (self.patch_size - remainder))
+            contents.append(content)
+
+        max_content_length = max(len(content) for content in contents)
+        contents = [
+            content + [PAD_TOKEN] * (max_content_length - len(content))
+            for content in contents
+        ]
+        self._check_context_length(max_content_length)
+
+        ext_ids = [extension_tokens(ext, self.patch_size) for ext in exts]
+        padded = pad_input_for_bgpt(
+            contents,
+            ext_ids,
+            device=self.device,
+            patch_size=self.patch_size,
+        )
+        return padded, payload_offsets
+
+    def _model_logits(self, padded: dict, batch_size: int) -> torch.Tensor:
+        """Return one next-byte logit row per prepared content token."""
+        with torch.inference_mode():
+            output = self.model(
+                patches=padded["patches"], masks=padded["masks"])
+            logits_raw = output.logits
+
+        if logits_raw.shape[0] % batch_size:
+            raise RuntimeError(
+                "bGPT returned a non-uniform number of patch pairs per sample")
+        pairs_per_sample = logits_raw.shape[0] // batch_size
+        logits_4d = logits_raw.reshape(
+            batch_size,
+            pairs_per_sample,
+            self.patch_size + 1,
+            VOCAB_SIZE,
+        )
+        # The final pair predicts the explicit end patch. It is model framing,
+        # not part of header/condition/payload content.
+        return logits_4d[:, :-1, :-1, :].reshape(
+            batch_size, -1, VOCAB_SIZE)
 
     def _prefill(
         self,
         segments: List[Tuple[bytes, str]],
         prefixes: Optional[Sequence[Sequence[int]]] = None,
-    ) -> Tuple[dict, torch.Tensor, List[int], int]:
-        """Single forward over a padded batch of segments.
+    ) -> Tuple[dict, torch.Tensor, List[int], List[int]]:
+        """Run one teacher-forced batch over header + condition + payload.
 
-        Returns ``(padded, logits_per_sample, orig_lengths, prefix_length)`` where
-        ``padded`` is the bGPT model input, ``logits_per_sample[b, i]`` predicts
-        combined token ``i`` of sample ``b`` (the ``prefix_length`` prefix tokens
-        first, then the payload), and ``orig_lengths[b]`` is the sample's true
-        (pre-padding) payload length. Shared by :meth:`compress_batch` (range
-        coding) and :meth:`score_batch` (NLL only).
-
-        When ``prefixes`` is given its byte tokens are inserted between the
-        extension patch and the payload, so the model conditions on them exactly
-        as ``LLMCompressor`` conditions on ``PromptContext`` tokens; callers skip
-        the first ``prefix_length`` logits to code only the payload.
+        Returns ``(model_input, logits, raw_payload_lengths, payload_offsets)``.
+        Offsets are relative to the prepared content, after the extension patch.
         """
-        B             = len(segments)
-        prefix_length = self._prefix_length(prefixes, B)
-
-        ext_ids_list  = [extension_tokens(ext, self.patch_size) for _, ext in segments]
-        payload_list  = [bytes_to_padded_tokens(raw, self.patch_size) for raw, _ in segments]
-        orig_lengths  = [len(p) for p in payload_list]
-        max_orig_len  = max(orig_lengths)
-
-        # Pad shorter payloads to the longest in the batch, then prepend the
-        # per-sample prefix so every "segment" fed to pad_input_for_bgpt has the
-        # uniform length prefix_length + max_orig_len.
-        payload_list = [
-            p + [PAD_TOKEN] * (max_orig_len - len(p))
-            for p in payload_list
-        ]
-        if prefix_length:
-            payload_list = [list(prefixes[b]) + payload_list[b] for b in range(B)]
-
-        padded = pad_input_for_bgpt(
-            payload_list, ext_ids_list,
-            device=self.device, patch_size=self.patch_size,
-        )
-
-        with torch.inference_mode():
-            out        = self.model(patches=padded["patches"], masks=padded["masks"])
-            logits_raw = out.logits   # (B * pairs_per_sample, patch_size+1, VOCAB)
-
-        pairs_per_sample  = logits_raw.shape[0] // B
-        logits_4d         = logits_raw.reshape(B, pairs_per_sample, self.patch_size + 1, VOCAB_SIZE)
-        # (B, prefix_length + max_orig_len, VOCAB) — slice per sample below to skip
-        # the prefix and keep its actual payload length.
-        logits_per_sample = logits_4d[:, :-1, :-1, :].reshape(B, -1, VOCAB_SIZE)
-        return padded, logits_per_sample, orig_lengths, prefix_length
+        for sample_idx, (raw, _) in enumerate(segments):
+            if not isinstance(raw, bytes):
+                raise TypeError(
+                    f"payload {sample_idx} must be bytes, got {type(raw)!r}")
+        payloads = [list(raw) for raw, _ in segments]
+        exts = [ext for _, ext in segments]
+        padded, payload_offsets = self._prepare_input(payloads, exts, prefixes)
+        logits = self._model_logits(padded, len(segments))
+        return padded, logits, [len(raw) for raw, _ in segments], payload_offsets
 
     def compress_batch(
         self,
         segments: List[Tuple[bytes, str]],
         prefixes: Optional[Sequence[Sequence[int]]] = None,
     ) -> List[CompressedData]:
-        """Compress multiple segments in a single forward pass.
-
-        Segments with different byte lengths (e.g. the last audio chunk) are
-        padded to the longest payload in the batch with PAD_TOKEN.  Each
-        CompressedData stores the actual original_length so the decoder knows
-        how many tokens to recover. An optional per-segment ``prefixes`` (byte
-        tokens of retrieved base chunks) conditions the model while the coder
-        skips it — the byte-domain analog of ``LLMCompressor``'s ``prompt_ctx``.
-        """
+        """Compress only payload bytes, with header/prefix supplied for free."""
         if not segments:
             return []
 
-        padded, logits_per_sample, orig_lengths, prefix_length = self._prefill(segments, prefixes)
+        padded, logits, lengths, offsets = self._prefill(segments, prefixes)
+        results: List[CompressedData] = []
+        for sample_idx, ((_, ext), payload_length, offset) in enumerate(
+                zip(segments, lengths, offsets)):
+            start = self.patch_size + offset
+            target = padded["patches"][
+                sample_idx:sample_idx + 1, start:start + payload_length]
+            dummy = torch.full(
+                (1, 1), PAD_TOKEN, dtype=torch.long, device=self.device)
+            coder_input = torch.cat([dummy, target], dim=1)
+            payload_logits = logits[
+                sample_idx:sample_idx + 1, offset:offset + payload_length, :]
 
-        results = []
-        for b, (_, ext) in enumerate(segments):
-            orig_len  = orig_lengths[b]
-            # Extract only the actual (non-padding) payload tokens and logits,
-            # skipping the extension patch and the prefix_length prefix tokens.
-            start     = self.patch_size + prefix_length
-            payload_t = padded["patches"][b:b+1, start : start + orig_len]
-            prefix    = torch.full((1, 1), PAD_TOKEN, dtype=torch.long, device=self.device)
-            ac_input  = torch.cat([prefix, payload_t], dim=1)
-            logits_b  = logits_per_sample[b:b+1, prefix_length : prefix_length + orig_len, :]  # (1, orig_len, VOCAB)
-
-            cd = self._encode_sequence(ac_input, logits_b, prefix_length=1)
-            cd.metadata["ext"] = ext.lower().lstrip(".")
-            results.append(cd)
-
+            compressed = self._encode_sequence(
+                coder_input, payload_logits, prefix_length=1)
+            compressed.metadata.update({
+                "ext": ext.lower().lstrip("."),
+                "free_header_bytes": len(free_context_header(ext)),
+            })
+            results.append(compressed)
         return results
 
     def score_batch(
@@ -170,27 +232,24 @@ class BGPTCompressor(BaseCompressor):
         segments: List[Tuple[bytes, str]],
         prefixes: Optional[Sequence[Sequence[int]]] = None,
     ) -> List[LMScore]:
-        """Code length (bits) + per-token NLL per segment — no range coding.
-
-        The score-only counterpart of :meth:`compress_batch` (shares
-        :meth:`_prefill`), mirroring ``LLMCompressor.score_batch`` so byte-domain
-        callers can rank inputs (and prefix conditions) by exact code length
-        without paying for coding — this is what ``RACBGPTCompressor``'s oracle
-        ranks retrieved byte prefixes with.
-        """
+        """Return payload code length and byte NLL without range coding."""
         if not segments:
             return []
 
-        padded, logits_per_sample, orig_lengths, prefix_length = self._prefill(segments, prefixes)
-
+        padded, logits, lengths, offsets = self._prefill(segments, prefixes)
         results: List[LMScore] = []
-        for b in range(len(segments)):
-            orig_len = orig_lengths[b]
-            start = self.patch_size + prefix_length
-            target = padded["patches"][b, start: start + orig_len]                         # [orig_len]
-            lg = logits_per_sample[b, prefix_length: prefix_length + orig_len, :]           # [orig_len, V]
-            nll = -lg.log_softmax(dim=-1).gather(1, target.unsqueeze(1)).squeeze(1)
-            results.append(LMScore(bits=float(nll.sum().item()) / math.log(2), token_nll=nll))
+        for sample_idx, (payload_length, offset) in enumerate(zip(lengths, offsets)):
+            start = self.patch_size + offset
+            target = padded["patches"][
+                sample_idx, start:start + payload_length]
+            payload_logits = logits[
+                sample_idx, offset:offset + payload_length, :]
+            nll = -payload_logits.log_softmax(dim=-1).gather(
+                1, target.unsqueeze(1)).squeeze(1)
+            results.append(LMScore(
+                bits=float(nll.sum().item()) / math.log(2),
+                token_nll=nll,
+            ))
         return results
 
     def decompress_batch(
@@ -200,51 +259,52 @@ class BGPTCompressor(BaseCompressor):
         max_tokens: Optional[int] = None,
         show_progress: bool = False,
     ) -> List[bytes]:
-        """Decompress N samples with one forward pass per token step.
-
-        Samples with different original_length are handled by padding all
-        decoded buffers to the longest sequence; _decode_batch freezes each
-        sequence once its own original_length is reached. When ``prefixes`` is
-        given (the same per-segment byte tokens used to compress) it is prepended
-        to the decoded-so-far payload before every forward pass — the byte-domain
-        analog of decoding under ``LLMCompressor``'s ``prompt_ctx`` — and sliced
-        back off the returned logits so ``_decode_batch`` still sees one logit row
-        per payload token.
-        """
+        """Decode payloads under the same free header and RAC conditions."""
         if not compressed_list:
             return []
 
-        B            = len(compressed_list)
-        max_orig_len = max(cd.original_length for cd in compressed_list)
-        prefix_length = self._prefix_length(prefixes, B)
-        ext_ids_list = [
-            extension_tokens(cd.metadata.get("ext", "bin"), self.patch_size)
-            for cd in compressed_list
-        ]
+        batch_size = len(compressed_list)
+        lengths = [compressed.original_length for compressed in compressed_list]
+        max_payload_length = max(lengths)
+        exts: List[str] = []
+        for sample_idx, compressed in enumerate(compressed_list):
+            if "ext" not in compressed.metadata:
+                raise ValueError(
+                    f"compressed sample {sample_idx} has no media extension metadata")
+            ext = compressed.metadata["ext"]
+            if not isinstance(ext, str):
+                raise ValueError(
+                    f"compressed sample {sample_idx} has invalid media extension "
+                    f"metadata {ext!r}")
+            exts.append(ext)
 
-        def get_logits_fn(buf: torch.Tensor) -> torch.Tensor:
-            # buf: [B, 1 + max_orig_len]  (buf[:, 0] is the throwaway BOS slot)
-            decoded_so_far = [buf[b, 1:].tolist() for b in range(B)]
-            if prefix_length:
-                decoded_so_far = [list(prefixes[b]) + d for b, d in enumerate(decoded_so_far)]
-            padded = pad_input_for_bgpt(
-                decoded_so_far, ext_ids_list,
-                device=self.device, patch_size=self.patch_size,
-                pad_to_length=prefix_length + max_orig_len,
-            )
-            with torch.inference_mode():
-                out        = self.model(patches=padded["patches"], masks=padded["masks"])
-                logits_raw = out.logits   # (B * pairs_per_sample, patch_size+1, VOCAB)
-            pairs_per_sample = logits_raw.shape[0] // B
-            logits_4d        = logits_raw.reshape(B, pairs_per_sample, self.patch_size + 1, VOCAB_SIZE)
-            logits_ps        = logits_4d[:, :-1, :-1, :].reshape(B, -1, VOCAB_SIZE)
-            # Drop the prefix logits so index i again predicts payload token i.
-            return logits_ps[:, prefix_length:, :]
+        def get_logits_fn(buffer: torch.Tensor) -> torch.Tensor:
+            payloads = [
+                buffer[sample_idx, 1:1 + payload_length].tolist()
+                for sample_idx, payload_length in enumerate(lengths)
+            ]
+            padded, offsets = self._prepare_input(payloads, exts, prefixes)
+            logits = self._model_logits(padded, batch_size)
 
-        prefix = torch.full((B, 1), PAD_TOKEN, dtype=torch.long, device=self.device)
-        decoded_lists = self._decode_batch(
-            compressed_list, get_logits_fn, prefix, self.device,
-            pad_fill=PAD_TOKEN, max_tokens=max_tokens,
+            # BaseCompressor expects payload-relative rows shared in one dense
+            # tensor, while free-header/prefix offsets may differ by sample.
+            aligned = logits.new_zeros(
+                (batch_size, max_payload_length, VOCAB_SIZE))
+            for sample_idx, (payload_length, offset) in enumerate(
+                    zip(lengths, offsets)):
+                aligned[sample_idx, :payload_length] = logits[
+                    sample_idx, offset:offset + payload_length]
+            return aligned
+
+        dummy = torch.full(
+            (batch_size, 1), PAD_TOKEN, dtype=torch.long, device=self.device)
+        decoded = self._decode_batch(
+            compressed_list,
+            get_logits_fn,
+            dummy,
+            self.device,
+            pad_fill=PAD_TOKEN,
+            max_tokens=max_tokens,
             show_progress=show_progress,
         )
-        return [tokens_to_bytes(d) for d in decoded_lists]
+        return [tokens_to_bytes(tokens) for tokens in decoded]

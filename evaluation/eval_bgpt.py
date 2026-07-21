@@ -8,13 +8,14 @@ python evaluation/eval_bgpt.py \\
     --dataset  datasets/clic2024/bmp \\
     --model    pretrained/bgpt/weights-image.pth \\
     --n-samples 100 \\
+    --image-patch-width 32 --image-patch-height 32 \\
     --device cuda:0 \\
     --output results/bgpt_image.csv
 
 # Audio (preprocessed native-rate / mono / 8-bit PCM WAV directory)
 python evaluation/eval_bgpt.py \\
     --modality audio \\
-    --dataset  datasets/peoples_speech_microset_wav \\
+    --dataset  datasets/ljspeech_wav \\
     --model    pretrained/bgpt/weights-audio.pth \\
     --n-samples 50 \\
     --device cuda:0,cuda:1 \\
@@ -45,7 +46,7 @@ from utils.audio_utils import (
     pcm_payload_to_wav,
 )
 from utils.img_utils import (
-    load_image_files, reassemble_image_patches, ImagePatch,
+    load_image_files, reassemble_image_patches, validate_bmp_patch_shape,
     patchify_images_for_compression,
 )
 from utils.eval_utils import (
@@ -54,8 +55,13 @@ from utils.eval_utils import (
     parse_devices, run_multi_gpu,
     save_csv, save_compressed, save_decompressed,
 )
-from utils.bgpt_codec_utils import pad_input_for_bgpt, bytes_to_padded_tokens
-from compression.bgpt_compressor import BGPTCompressor
+from utils.bgpt_codec_utils import pad_input_for_bgpt
+from compression.bgpt_compressor import (
+    AUDIO_BODY_BYTES,
+    IMAGE_BODY_BYTES,
+    BGPTCompressor,
+    free_context_header,
+)
 from bgpt.utils import bGPTLMHeadModel
 from bgpt.config import BYTE_NUM_LAYERS, HIDDEN_SIZE, PATCH_NUM_LAYERS, PATCH_SIZE
 PATCH_LENGTH = 512
@@ -87,13 +93,13 @@ def _load_model(checkpoint_path: str, device: torch.device) -> bGPTLMHeadModel:
 # Workers (module-level → picklable for mp.spawn)
 # ---------------------------------------------------------------------------
 
-def _bgpt_probe_factory(model, device):
+def _bgpt_probe_factory(model, device, ext: str):
     """Return a probe_fn compatible with auto_batch_size for bGPT forward passes."""
     def _probe(batch_sz: int, seq_len: int) -> None:
         payload = [0] * seq_len
-        ext = [ord("b"), ord("m"), ord("p")]
+        ext_tokens = [ord(char) for char in ext]
         padded = pad_input_for_bgpt(
-            [payload] * batch_sz, [ext] * batch_sz,
+            [payload] * batch_sz, [ext_tokens] * batch_sz,
             device=device, patch_size=PATCH_SIZE,
         )
         with torch.inference_mode():
@@ -109,7 +115,8 @@ def _image_worker(
     no_decomp: bool,
     save_comp_dir: Optional[str],
     save_decomp_dir: Optional[str],
-    image_patch_px: int,
+    image_patch_width: int,
+    image_patch_height: int,
     max_decode_tokens: Optional[int] = None,
 ) -> List[EvalResult]:
     import tqdm
@@ -119,15 +126,18 @@ def _image_worker(
 
     # ── 1. Preprocessing: patchify all images ─────────────────────────────────
     all_patches = patchify_images_for_compression(
-        bmp_files, indices, image_patch_px)
+        bmp_files, indices,
+        patch_width=image_patch_width,
+        patch_height=image_patch_height,
+    )
 
     # ── 2. Auto-select batch size ─────────────────────────────────────────────
-    # All patches are the same byte size; use the first as the representative length.
-    # have to use bytes_to_padded_tokens to pad the sequence to a multiple of the PATCH_SIZE
-    rep_lens = [len(bytes_to_padded_tokens(
-        all_patches[0].patch.data, PATCH_SIZE))] if all_patches else []
+    # Include the free header when probing the model's actual sequence length.
+    rep_lens = [
+        len(free_context_header("bmp")) + len(all_patches[0].data)
+    ] if all_patches else []
     batch_size = auto_batch_size(
-        _bgpt_probe_factory(model, device), device, rep_lens,
+        _bgpt_probe_factory(model, device, "bmp"), device, rep_lens,
         max_batch=512, n_samples=len(all_patches), verbose=True,
     )
     print(f"  [{device}] batch_size={batch_size}  images={len(indices)}  patches={len(all_patches)}")
@@ -138,12 +148,10 @@ def _image_worker(
 
     def _process_patch_batch(batch_positions: List[int]) -> None:
         batch = [all_patches[pos] for pos in batch_positions]
-        patches_b = [r.patch for r in batch]
-        sids_b = [r.sample_idx for r in batch]
 
         with MemoryTracker(device) as mem:
             t0 = time.time()
-            cds = comp.compress_batch([(p.data, "bmp") for p in patches_b])
+            cds = comp.compress_batch([(r.data, "bmp") for r in batch])
             compress_s = time.time() - t0
         per_c_s = compress_s / len(batch)
 
@@ -155,15 +163,16 @@ def _image_worker(
                                          max_tokens=max_decode_tokens)
             per_d_s = (time.time() - t0) / len(batch)
 
-        for local_i, (patch, sid, cd) in enumerate(zip(patches_b, sids_b, cds)):
+        for local_i, (rec, cd) in enumerate(zip(batch, cds)):
             rt_ok = -1
             rec_data = None
             if recs is not None:
                 rec_data = recs[local_i]
-                rt_ok = -1 if max_decode_tokens else int(rec_data == patch.data)
+                rt_ok = -1 if max_decode_tokens else int(rec_data == rec.data)
             if save_comp_dir:
                 save_compressed(cd.compressed_bytes, cd.metadata, cd.original_length,
-                                save_comp_dir, f"image{indices[sid]:06d}_p{patch.index:04d}")
+                                save_comp_dir,
+                                f"image{indices[rec.sample_idx]:06d}_p{rec.patch_idx:04d}")
             patch_results[batch_positions[local_i]] = (
                 cd, rt_ok, per_c_s, per_d_s, mem, rec_data)
 
@@ -188,7 +197,7 @@ def _image_worker(
         recs = [all_patches[pos] for pos in pos_list]
         data = [patch_results[pos] for pos in pos_list]
 
-        orig_bytes = sum(len(r.patch.data) for r in recs)
+        orig_bytes = sum(len(r.data) for r in recs)
         comp_bytes = sum(d[0].compressed_length for d in data)
         rt_ok = (1 if all(d[1] == 1 for d in data) else
                  -1 if all(d[1] == -1 for d in data) else 0)
@@ -198,12 +207,10 @@ def _image_worker(
         mem = data[0][4]
 
         if save_decomp_dir and all(d[5] is not None for d in data):
-            rec_patches = [
-                ImagePatch(index=r.patch.index, x=r.patch.x, y=r.patch.y,
-                           width=r.patch.width, height=r.patch.height, data=d[5])
-                for r, d in zip(recs, data)
-            ]
-            img = reassemble_image_patches(rec_patches, recs[0].meta)
+            r0 = recs[0]
+            img = reassemble_image_patches(
+                [d[5] for d in data], r0.orig_width, r0.orig_height,
+                r0.patch_width, r0.patch_height)
             os.makedirs(save_decomp_dir, exist_ok=True)
             img.save(os.path.join(save_decomp_dir, f"{sample_id}.bmp"))
 
@@ -227,7 +234,6 @@ def _audio_worker(
     no_decomp: bool,
     save_comp_dir: Optional[str],
     save_decomp_dir: Optional[str],
-    audio_chunk_bytes: int,
     max_decode_tokens: Optional[int] = None,
 ) -> List[EvalResult]:
     import tqdm
@@ -236,14 +242,16 @@ def _audio_worker(
     comp = BGPTCompressor(model, patch_size=PATCH_SIZE, device=device)
 
     # ── 1. Preprocessing: chunk all audio clips ───────────────────────────────
-    all_chunks = chunk_audio_for_compression(samples, indices, audio_chunk_bytes)
+    all_chunks = chunk_audio_for_compression(
+        samples, indices, AUDIO_BODY_BYTES)
 
     # ── 2. Auto-select batch size ─────────────────────────────────────────────
-    # All chunks are the same byte size; use the first as the representative length.
-    rep_lens = [len(bytes_to_padded_tokens(
-        all_chunks[0].data, PATCH_SIZE))] if all_chunks else []
+    # Include the free header when probing the model's actual sequence length.
+    rep_lens = [
+        len(free_context_header("wav")) + len(all_chunks[0].data)
+    ] if all_chunks else []
     batch_size = auto_batch_size(
-        _bgpt_probe_factory(model, device), device, rep_lens,
+        _bgpt_probe_factory(model, device, "wav"), device, rep_lens,
         max_batch=512, n_samples=len(all_chunks), verbose=True,
     )
     print(
@@ -357,10 +365,10 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Skip decompression")
     p.add_argument("--max-decode-tokens", type=int, default=None,
                    help="Decode only the first N tokens per sample (round-trip check skipped)")
-    p.add_argument("--image-patch-px", type=int, default=32,
-                   help="Pixel patch size (image, default: 32)")
-    p.add_argument("--audio-chunk-bytes", type=int, default=8000,
-                   help="Audio chunk length in bytes (default: 8000)")
+    p.add_argument("--image-patch-width", type=int, default=None,
+                   help="Image patch width (required for image)")
+    p.add_argument("--image-patch-height", type=int, default=None,
+                   help="Image patch height (required for image)")
     p.add_argument("--tmp-dir", default="tmp",
                    help="Directory for inter-process temp files (default: tmp)")
     return p
@@ -372,8 +380,19 @@ def main():
     devices = parse_devices(args.device)
 
     if args.modality == "image":
+        if args.image_patch_width is None or args.image_patch_height is None:
+            raise ValueError(
+                "image evaluation requires --image-patch-width and "
+                "--image-patch-height")
+        image_patch_width, image_patch_height = validate_bmp_patch_shape(
+            IMAGE_BODY_BYTES,
+            width=args.image_patch_width,
+            height=args.image_patch_height,
+        )
         samples = load_image_files(args.dataset, args.n_samples)
-        print(f"Loaded {len(samples)} image files | devices: {devices}")
+        print(f"Loaded {len(samples)} image files | payload patch "
+              f"{image_patch_width}x{image_patch_height} "
+              f"({IMAGE_BODY_BYTES} B) | devices: {devices}")
         results = run_multi_gpu(
             _image_worker, list(range(len(samples))), devices,
             fn_kwargs=dict(
@@ -381,14 +400,16 @@ def main():
                 no_decomp=args.no_decompress,
                 save_comp_dir=args.save_compressed,
                 save_decomp_dir=args.save_decompressed,
-                image_patch_px=args.image_patch_px,
+                image_patch_width=image_patch_width,
+                image_patch_height=image_patch_height,
                 max_decode_tokens=args.max_decode_tokens,
             ),
             tmp_prefix=os.path.join(args.tmp_dir, '_eval_worker'),
         )
     else:  # audio
         samples = load_audio_samples(args.dataset, args.n_samples)
-        print(f"Loaded {len(samples)} audio samples | devices: {devices}")
+        print(f"Loaded {len(samples)} audio samples | payload chunk "
+              f"{AUDIO_BODY_BYTES} B | devices: {devices}")
         results = run_multi_gpu(
             _audio_worker, list(range(len(samples))), devices,
             fn_kwargs=dict(
@@ -396,7 +417,6 @@ def main():
                 no_decomp=args.no_decompress,
                 save_comp_dir=args.save_compressed,
                 save_decomp_dir=args.save_decompressed,
-                audio_chunk_bytes=args.audio_chunk_bytes,
                 max_decode_tokens=args.max_decode_tokens,
             ),
             tmp_prefix=os.path.join(args.tmp_dir, '_eval_worker'),

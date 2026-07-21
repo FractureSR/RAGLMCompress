@@ -1,17 +1,17 @@
 """Build the RAC retrieval **database** — that is all this does now.
 
-No training, no test/train pieces, no precomputed retrieval. We fix a slice of a
-dataset as the base corpus, chunk it into retrieval units (LM tokens, which double
-as the raw-token conditions prepended at compression), and index it.
+No training and no precomputed retrieval. We split a dataset into a base corpus
+and held-out evaluation documents, chunk the base into retrieval units (LM
+tokens, which double as raw-token conditions), and index it.
 ``eval_rac_llm.py`` then chunks + retrieves the held-out eval docs *live*, exactly the
 way ``eval_llm.py`` chunks its input.
 
 Outputs under ``--out``:
   base_chunks.json  [{id, doc_idx, text, token_ids}]  retrieval units / conditions
+  eval_docs.jsonl   held-out documents consumed directly by eval_rac_llm.py
   retriever/        saved BM25 / dense / hybrid index
   meta.json         {dataset, seed, base_frac, n_docs, base_doc_indices,
-                     chunk_size, signals, model}  (eval reads base_doc_indices to
-                     take the held-out complement as the eval set)
+                     chunk_size, signals, model}
 
 Example
 -------
@@ -46,7 +46,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--chunk-overlap", type=int, default=0)
     p.add_argument("--model", required=True, help="Compression LM (its tokenizer chunks the base)")
     p.add_argument("--retriever", default="bm25", choices=["bm25", "dense", "hybrid"],
-                   help="retrieval signal: bm25 (syntactic, default — claim 2.1.1), dense, hybrid")
+                   help="retrieval signal: bm25, dense, hybrid")
     p.add_argument("--embed-model", default="Qwen/Qwen3-Embedding-0.6B")
     p.add_argument("--embed-batch-size", type=int, default=64)
     p.add_argument("--device", default=None)
@@ -58,6 +58,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = _build_parser().parse_args()
+    if not 0 < args.base_frac < 1:
+        raise ValueError(f"--base-frac must be between 0 and 1, got {args.base_frac}")
     from transformers import AutoTokenizer
     lm_tok = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 
@@ -68,7 +70,9 @@ def main() -> None:
     base_set = set(idx[:n_base])
     base_doc_indices = sorted(base_set)
     base_docs = [docs[i] for i in base_doc_indices]
-    eval_docs = [docs[i] for i in range(len(docs)) if i not in base_set]   # held-out, original order
+    eval_docs = [
+        docs[i] for i in range(len(docs)) if i not in base_set
+    ]  # held-out, original order
     print(f"Docs: {len(docs)} | base: {len(base_docs)} | eval (held-out): {len(eval_docs)}")
 
     # align_last_window: every base chunk is exactly chunk_size tokens, so all
@@ -77,7 +81,7 @@ def main() -> None:
     chunks = chunk_documents_for_compression(
         base_docs, lm_tok, args.chunk_size, chunk_overlap=args.chunk_overlap,
         decode=True, align_last_window=True)
-    
+
     base = []
     for c in chunks:
         if not (c.text and c.text.strip() and c.token_ids):
@@ -89,10 +93,10 @@ def main() -> None:
         raise ValueError("No non-empty base chunks produced; increase --n-docs or --base-frac")
 
     os.makedirs(args.out, exist_ok=True)
-    
+
     with open(os.path.join(args.out, "base_chunks.json"), "w") as f:
         json.dump(base, f)
-        
+
     with open(os.path.join(args.out, "eval_docs.jsonl"), "w") as f:
         for doc in eval_docs:
             f.write(json.dumps({"text": doc}) + "\n")

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Build the RAC retrieval database (base corpus + index). No training, no test
-# pieces, no precomputed retrieval — eval_rac_llm.py chunks + retrieves the held-out
-# eval docs live.
+# Build the RAC retrieval database (base corpus, held-out docs, and index).
+# No training or precomputed retrieval: eval_rac_llm.py chunks and retrieves
+# the persisted held-out documents live.
 set -euo pipefail
 
 python utils/prepare_rac_data_llm.py \

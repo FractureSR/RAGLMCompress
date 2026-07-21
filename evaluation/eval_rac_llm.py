@@ -67,11 +67,11 @@ def _prefix_metrics(doc_data: List[tuple]) -> dict:
     gain_counts: Dict[int, int] = defaultdict(int)
 
     for cd, *_ in doc_data:
-        n_prefix = len(cd.metadata.get("ctx_ids", []))
+        n_prefix = len(cd.metadata["ctx_ids"])
         hist[n_prefix] += 1
-        gains = cd.metadata.get("ctx_gain_bits", [])
-        net_gains = cd.metadata.get("ctx_net_gain_bits", [])
-        id_bits = cd.metadata.get("ctx_id_bits", [])
+        gains = cd.metadata["ctx_gain_bits"]
+        net_gains = cd.metadata["ctx_net_gain_bits"]
+        id_bits = cd.metadata["ctx_id_bits"]
         for pos, gain in enumerate(gains, start=1):
             gain_sums[pos] += float(gain)
             net_gain_sums[pos] += float(net_gains[pos - 1])
@@ -120,7 +120,7 @@ def _rac_worker(
         index_coder=index_coder,
         max_ctx=cfg["max_ctx"],
         margin_bits=cfg["margin_bits"],
-        batch_size=cfg["batch_size"] or 1,
+        batch_size=cfg["batch_size"],
         cascade=cfg["cascade"],
         cascade_max_cond=cfg["cascade_max_cond"],
         cascade_nll_thresh=cfg["cascade_nll_thresh"],
@@ -282,7 +282,7 @@ def _calibrate(device, model_path, texts, calib_idx, database_dir, signals, embe
             llm, base_tokens,
             max_ctx=cfg["max_ctx"],
             margin_bits=cfg["margin_bits"],
-            batch_size=cfg["batch_size"] or 1,
+            batch_size=cfg["batch_size"],
             cascade=cfg["cascade"],
             cascade_max_cond=cfg["cascade_max_cond"],
             cascade_nll_thresh=cfg["cascade_nll_thresh"],
@@ -373,7 +373,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Oracle RAC compression evaluation — text")
     p.add_argument("--database", required=True,
-                   help="prepare_rac_data --out dir (base + index + meta + eval_docs)")
+                   help=("prepare_rac_data_llm.py --out directory "
+                         "(base chunks, held-out docs, index, and metadata)"))
     p.add_argument("--model", required=True)
     p.add_argument("--dataset", default=None,
                    help="eval corpus (default: --database/eval_docs.jsonl)")
@@ -382,10 +383,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--m", type=int, default=16,
                    help="top-k candidates tried per window")
     p.add_argument("--max-tokens", type=int, default=None,
-                   help="data piece size (default: LM ctx - max-ctx)")
-    p.add_argument("--max-ctx", type=int, default=None,
-                   help="total prefix-token budget "
-                        "(default: chunk_size * max conditions)")
+                   help="data piece size (default: LM context minus condition budget)")
     p.add_argument("--margin-bits", type=float, default=0.0)
     p.add_argument("--batch-size", type=int, default=None,
                    help="candidates scored per LM forward (default: auto-probe)")
@@ -417,16 +415,24 @@ def main() -> None:
     with open(os.path.join(args.database, "meta.json")) as f:
         meta = json.load(f)
 
-    # Prefix budget = one full retrieval unit per condition. Deriving it from the
-    # database chunk_size keeps max_ctx == chunk_size * max_cond, so no condition
-    # is ever truncated (see RACLLMCompressor); an explicit --max-ctx is validated
-    # by the same invariant.
+    # Prefix budget = one complete retrieval unit per possible condition.
     chunk_size = meta["chunk_size"]
     max_cond = args.cascade_max_cond if args.cascade else 1
-    max_ctx = args.max_ctx if args.max_ctx is not None else chunk_size * max_cond
+    if max_cond <= 0:
+        raise ValueError("--cascade-max-cond must be positive")
+    max_ctx = chunk_size * max_cond
 
     ctx_len = AutoConfig.from_pretrained(args.model).max_position_embeddings
-    max_tokens = args.max_tokens or (ctx_len - max_ctx)
+    max_tokens = (
+        args.max_tokens if args.max_tokens is not None else ctx_len - max_ctx)
+    if max_tokens <= 0:
+        raise ValueError(
+            f"condition budget {max_ctx} leaves no payload in the "
+            f"{ctx_len}-token model context")
+    if max_tokens + max_ctx > ctx_len:
+        raise ValueError(
+            f"payload ({max_tokens}) + condition budget ({max_ctx}) exceeds "
+            f"the model context ({ctx_len})")
 
     eval_path = args.dataset or os.path.join(args.database, "eval_docs.jsonl")
     n_calib = args.calib_docs if args.calibrate else 0

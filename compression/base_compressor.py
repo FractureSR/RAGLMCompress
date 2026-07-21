@@ -20,7 +20,7 @@ from compression.types import CompressedData
 
 
 def _normalize(pdf: np.ndarray) -> np.ndarray:
-    """Backward-compatible wrapper used by notebooks and diagnostics."""
+    """Normalize coder probabilities consistently during encode and decode."""
     return normalize_pdf(pdf, data_type=np.float32)
 
 

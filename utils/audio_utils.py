@@ -39,7 +39,13 @@ _AUDIO_LOADERS: Dict[str, AudioLoader] = {}
 
 
 def register_audio_loader(name: str):
-    """Register a loader selected by a normalized dataset path basename."""
+    """Register a loader selected by matching *name* against the dataset path.
+
+    *name* (hyphens normalised to underscores) must appear as a substring of
+    the whole normalised dataset path, so multi-segment names like
+    ``"vctk"`` match a path ``datasets/vctk_wav`` — not just the final
+    basename. When several names match, the longest (most specific) one wins.
+    """
     def decorator(fn: AudioLoader) -> AudioLoader:
         _AUDIO_LOADERS[name] = fn
         return fn
@@ -47,10 +53,15 @@ def register_audio_loader(name: str):
 
 
 def _find_audio_loader(path: str) -> AudioLoader:
-    key = os.path.basename(os.path.normpath(path)).lower().replace("-", "_")
+    key = os.path.normpath(path).replace(os.sep, "/").lower().replace("-", "_")
+    best_loader: Optional[AudioLoader] = None
+    best_len = -1
     for name, loader in _AUDIO_LOADERS.items():
-        if name.replace("-", "_") in key:
-            return loader
+        needle = name.replace(os.sep, "/").lower().replace("-", "_")
+        if needle in key and len(needle) > best_len:
+            best_loader, best_len = loader, len(needle)
+    if best_loader is not None:
+        return best_loader
     raise ValueError(
         f"No audio loader registered for {path!r}.\n"
         f"Known datasets: {sorted(_AUDIO_LOADERS)}.\n"
@@ -85,6 +96,7 @@ def _load_wav_dir(path: str, n: Optional[int]) -> List[bytes]:
     return samples
 
 
+@register_audio_loader("eval_samples.pkl")
 def load_rac_eval_samples(path: str, n: Optional[int] = None) -> List[bytes]:
     """Load preprocessed WAV bytes persisted by prepare_rac_data_bgpt."""
     pkl_path = os.path.join(path, "eval_samples.pkl") if os.path.isdir(path) else path
@@ -103,30 +115,19 @@ def load_rac_eval_samples(path: str, n: Optional[int] = None) -> List[bytes]:
     return selected
 
 
-@register_audio_loader("eval_samples.pkl")
-def _load_rac_eval_samples(path: str, n: Optional[int] = None) -> List[bytes]:
-    return load_rac_eval_samples(path, n)
-
-
 @register_audio_loader("ljspeech_wav")
 def _load_ljspeech(path: str, n: Optional[int] = None) -> List[bytes]:
     return _load_wav_dir(path, n)
 
-@register_audio_loader("p225")
-def _load_vtck(path: str, n: Optional[int] = None) -> List[bytes]:
-    return _load_wav_dir(path, n)
 
-@register_audio_loader("p226")
-def _load_vtck(path: str, n: Optional[int] = None) -> List[bytes]:
+@register_audio_loader("peoples_speech")
+def _load_peoples_speech(path: str, n: Optional[int] = None) -> List[bytes]:
     return _load_wav_dir(path, n)
 
 
-@register_audio_loader("hf_wav_u8_8k_trimmed")
-def _load_hf_wav_u8_8k_trimmed(
-    path: str,
-    n: Optional[int] = None,
-) -> List[bytes]:
-    return _load_wav_dir(os.path.join(path, "audio"), n)
+@register_audio_loader("vctk")
+def _load_vctk(path: str, n: Optional[int] = None) -> List[bytes]:
+    return _load_wav_dir(path, n)
 
 
 def _validate_wav(data: bytes, source: str) -> None:
@@ -174,7 +175,7 @@ class AudioChunkRecord:
 def chunk_audio_for_compression(
     samples: Sequence[bytes],
     indices: List[int],
-    audio_chunk_bytes: int = 8000,
+    audio_chunk_bytes: int,
 ) -> List[AudioChunkRecord]:
     """Split all audio clips in a worker shard into a flat list of AudioChunkRecords.
 

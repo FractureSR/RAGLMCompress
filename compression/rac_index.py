@@ -16,8 +16,8 @@ the stop symbol — so the per-piece index cost is
   CalibratedIndexCoder  entropy code against a static frequency table calibrated
                         on a held-out split — popular "template" chunks and the
                         common stop become cheap. ``-log2 p(choice)`` is exactly
-                        the arithmetic-code length under the static model, so we
-                        charge it directly (paper feature 3.3.3).
+                        the ideal symbol cost under the static model, which we
+                        charge directly (paper feature 3.3.3).
 
 Following the codebase convention, the chosen ids travel in
 ``CompressedData.metadata`` and their *bit cost* is added to the compressed size;
@@ -117,11 +117,19 @@ class CalibratedIndexCoder:
         with open(path) as f:
             cfg = json.load(f)
         return cls({int(k): v for k, v in cfg["counts"].items()},
-                   cfg["none_count"], cfg["total"], cfg["n_base"], cfg.get("alpha", 0.5))
+                   cfg["none_count"], cfg["total"], cfg["n_base"], cfg["alpha"])
 
 
 def load_index_coder(path: str):
     """Load whichever coder kind was saved at ``path``."""
     with open(path) as f:
-        kind = json.load(f).get("kind")
-    return {"fixed": FixedIndexCoder, "calibrated": CalibratedIndexCoder}[kind].load(path)
+        kind = json.load(f)["kind"]
+    coder_classes = {
+        "fixed": FixedIndexCoder,
+        "calibrated": CalibratedIndexCoder,
+    }
+    try:
+        coder_cls = coder_classes[kind]
+    except KeyError as exc:
+        raise ValueError(f"unsupported index coder kind {kind!r}") from exc
+    return coder_cls.load(path)
