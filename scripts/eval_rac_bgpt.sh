@@ -10,15 +10,29 @@ set -euo pipefail
 #    --no-decompress
 
 # Audio:
+# python evaluation/eval_rac_bgpt.py \
+#    --database results/rac_vctk \
+#    --model pretrained/bgpt/weights-audio.pth \
+#    --m 4 \
+#    --device "${DEVICE:-cuda:0}" \
+#    --n-samples 50 \
+#    --cascade \
+#    --cascade-max-cond 2 \
+#    --cascade-retriever \
+#    --calibrate \
+#    --calib-samples 10 \
+#    --no-decompress
+
 python evaluation/eval_rac_bgpt.py \
-    --database results/rac_vctk \
-    --model pretrained/bgpt/weights-audio.pth \
+    --database results/rac_eurosat_forest \
+    --model pretrained/bgpt/weights-image.pth \
     --m 4 \
-    --device "${DEVICE:-cuda:0}" \
-    --n-samples 50 \
+    --n-samples 500 \
+    --image-payload-width 32 --image-payload-height 24 \
     --cascade \
-    --cascade-max-cond 2 \
+    --cascade-max-cond 1 \
     --cascade-retriever \
     --calibrate \
-    --calib-samples 10 \
+    --calib-samples 100 \
+    --device "${DEVICE:-cuda:0}" \
     --no-decompress

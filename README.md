@@ -34,7 +34,7 @@ bytes and, for RAC, the transmitted condition-id cost.
   byte-preparation, and evaluation helpers. `prepare_rac_data_llm.py` /
   `prepare_rac_data_bgpt.py` build the RAC retrieval database for text / bytes.
 - `evaluation/`: CLI benchmark scripts (`eval_llm`, `eval_bgpt`, `eval_rac_llm`,
-  `eval_rac_bgpt`, image codec baselines).
+  `eval_rac_bgpt`) plus whole-sample conventional and delta baselines.
 - `scripts/`: dataset preparation and ready-to-run eval invocations.
 - `bgpt/`: upstream bGPT model/training code.
 
@@ -138,6 +138,24 @@ The retriever (`utils/rag_utils.py`) and the index coders
 (`compression/rac_index.py`) are modality-agnostic and shared as-is between the
 text and byte pipelines; only the featuriser differs (`make_text_retriever` vs
 `make_bgpt_retriever`, byte-k-gram BM25).
+
+## Conventional baselines
+
+The baseline suite evaluates the exact held-out split persisted by a RAC
+prepare directory. It compresses complete UTF-8 documents, complete RGB8
+images, or complete PCM_U8 clips—there is no matched-window track. Available
+methods are zstd `--ultra -22`, OpenZL, cmix, PNG/JPEG XL/WebP, FLAC, and the
+whole-reference delta codecs zstd `--patch-from`, bsdiff, and open-vcdiff.
+Delta rows charge a full-base reference ID plus the stop bit through the
+existing `FixedIndexCoder`.
+
+See [BASELINES.md](BASELINES.md) for the exact data/metadata accounting,
+image-BPP comparison caveat, dependencies, and commands. A convenience entry
+point is:
+
+```bash
+scripts/eval_baselines.sh text results/rac_c_db
+```
 
 ## Notes
 

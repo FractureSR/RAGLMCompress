@@ -116,8 +116,8 @@ def load_rac_eval_samples(path: str, n: Optional[int] = None) -> List[str]:
 # Built-in dataset loaders
 # ---------------------------------------------------------------------------
 
-@register_image_loader("clic2024")
-def _load_clic2024(path: str, n: Optional[int] = None) -> List[str]:
+@register_image_loader("eurosat/Forest")
+def load_eurosat_forest(path: str, n: Optional[int] = None) -> List[str]:
     return _load_image_dir(path, n, extensions=(".bmp",))
 
 

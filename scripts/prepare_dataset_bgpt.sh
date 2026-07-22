@@ -14,12 +14,19 @@ set -euo pipefail
 #    --out results/rac_img_db
 
 # Audio
+# python utils/prepare_rac_data_bgpt.py \
+#    --dataset datasets/vctk_wav --modality audio \
+#    --n-samples 200 \
+#    --base-frac 0.5 \
+#    --audio-chunk-bytes 512 \
+#    --retriever bm25 \
+#    --kgram 8 \
+#    --seed 42 \
+#    --out results/rac_vctk
+
 python utils/prepare_rac_data_bgpt.py \
-    --dataset datasets/vctk_wav --modality audio \
-    --n-samples 200 \
-    --base-frac 0.5 \
-    --audio-chunk-bytes 512 \
-    --retriever bm25 \
-    --kgram 8 \
-    --seed 42 \
-    --out results/rac_vctk
+    --dataset datasets/eurosat/Forest --modality image \
+    --n-samples 2000 --base-frac 0.5 \
+    --image-patch-width 32 --image-patch-height 8 \
+    --retriever bm25 --kgram 4 --seed 42 \
+    --out results/rac_eurosat_forest
