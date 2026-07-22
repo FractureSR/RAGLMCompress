@@ -120,12 +120,7 @@ def _load_ljspeech(path: str, n: Optional[int] = None) -> List[bytes]:
     return _load_wav_dir(path, n)
 
 
-@register_audio_loader("peoples_speech")
-def _load_peoples_speech(path: str, n: Optional[int] = None) -> List[bytes]:
-    return _load_wav_dir(path, n)
-
-
-@register_audio_loader("vctk")
+@register_audio_loader("vctk/p225")
 def _load_vctk(path: str, n: Optional[int] = None) -> List[bytes]:
     return _load_wav_dir(path, n)
 

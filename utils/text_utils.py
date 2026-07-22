@@ -168,29 +168,13 @@ def _load_jsonl(
 # Built-in dataset loaders
 # ---------------------------------------------------------------------------
 
-@register_text_loader("cosmopedia")
-def _load_cosmopedia(path: str, n: Optional[int] = None, skip: int = 0) -> List[str]:
-    return _load_hf(path, ("text",), n, skip)
+@register_text_loader("eurlex/caselaw.jsonl")
+def _load_eurlex_caselaw(path: str, n: Optional[int] = None, skip: int = 0) -> List[str]:
+    return _load_jsonl(path, ("text",), n, skip)
 
-
-@register_text_loader("enwiki")
-def _load_enwiki(path: str, n: Optional[int] = None, skip: int = 0) -> List[str]:
-    return _load_hf(path, ("text",), n, skip)
-
-
-@register_text_loader("codeparrot_github_code/C.jsonl")
-def _load_codeparrot_github_code_C(path: str, n: Optional[int] = None, skip: int = 0) -> List[str]:
-    return _load_jsonl(path, ("code",), n, skip)
-
-
-@register_text_loader("codeparrot_github_code/Java.jsonl")
-def _load_codeparrot_github_code_Java(path: str, n: Optional[int] = None, skip: int = 0) -> List[str]:
-    return _load_jsonl(path, ("code",), n, skip)
-
-
-@register_text_loader("codeparrot_github_code/Python.jsonl")
-def _load_codeparrot_github_code_Python(path: str, n: Optional[int] = None, skip: int = 0) -> List[str]:
-    return _load_jsonl(path, ("code",), n, skip)
+@register_text_loader("eurlex/regulation.jsonl")
+def _load_eurlex_regulation(path: str, n: Optional[int] = None, skip: int = 0) -> List[str]:
+    return _load_jsonl(path, ("text",), n, skip)
 
 @register_text_loader("arxiv_tex/cs_ar.jsonl")
 def _load_arxiv_tex_cs_ar(path: str, n: Optional[int] = None, skip: int = 0) -> List[str]:

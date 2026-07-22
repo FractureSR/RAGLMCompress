@@ -132,7 +132,14 @@ the retrieved condition shape. RAC evaluation requires both
 `--image-payload-width` and `--image-payload-height`; baseline evaluation likewise
 requires both `--image-patch-width` and `--image-patch-height`. The pipeline only
 validates the supplied rectangle against BMP row alignment and the exact byte
-budget. It never infers either dimension.
+budget. It never infers either dimension —
+`scripts/image_payload_shape.py --database DB` prints the rectangle that fits a
+prepared database's remaining budget, to be passed explicitly.
+
+Patches on the right and bottom edges are **clipped** to the image, like the
+audio chunker's short final chunk, so no invented bytes are ever compressed and
+each image's payloads sum to its true size. Base chunks keep only full-size
+patches, so every retrieved condition still has one length.
 
 The retriever (`utils/rag_utils.py`) and the index coders
 (`compression/rac_index.py`) are modality-agnostic and shared as-is between the

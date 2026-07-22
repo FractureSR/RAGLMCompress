@@ -14,7 +14,6 @@ Adding a new dataset
 from __future__ import annotations
 
 import glob as _glob
-import io
 import os
 import pickle
 from dataclasses import dataclass
@@ -120,6 +119,18 @@ def load_rac_eval_samples(path: str, n: Optional[int] = None) -> List[str]:
 def load_eurosat_forest(path: str, n: Optional[int] = None) -> List[str]:
     return _load_image_dir(path, n, extensions=(".bmp",))
 
+@register_image_loader("eurosat/Industry")
+def load_eurosat_industry(path: str, n: Optional[int] = None) -> List[str]:
+    return _load_image_dir(path, n, extensions=(".bmp",))
+
+@register_image_loader("medmnist/bloodmnist28/test")
+def load_eurosat_medmnist_bloodmnist28(path: str, n: Optional[int] = None) -> List[str]:
+    return _load_image_dir(path, n, extensions=(".bmp",))
+
+@register_image_loader("medmnist/retinamnist128/test")
+def load_eurosat_medmnist_retinamnist128(path: str, n: Optional[int] = None) -> List[str]:
+    return _load_image_dir(path, n, extensions=(".bmp",))
+
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -133,17 +144,19 @@ class ImagePatchRecord:
     is the header-free BMP pixel array: BGR channels, bottom-up rows, and
     four-byte row alignment. ``sample_idx`` identifies the source image and
     ``patch_idx`` is the raster position within it. ``orig_width``/``orig_height``
-    and the rectangular ``patch_width``/``patch_height`` are enough to place the
-    patch and crop the image back. Patch x/y are derived from ``patch_idx`` at
-    reassembly, not stored.
+    and the nominal ``patch_width``/``patch_height`` are enough to place the
+    patch and rebuild the image. Patch x/y and its clipped size are derived from
+    ``patch_idx`` at reassembly, not stored — an edge patch holds fewer bytes
+    than the nominal rectangle because it is clipped to the image rather than
+    padded out to it.
     """
     data:        bytes
     sample_idx:  int   # index into the worker's local sample list
     patch_idx:   int   # 0-based raster position within this image's patches
-    orig_width:  int   # source image width  (to place patches and crop back)
+    orig_width:  int   # source image width  (to place patches and rebuild)
     orig_height: int   # source image height
-    patch_width: int   # patch width in pixels
-    patch_height: int  # patch height in pixels
+    patch_width: int   # nominal grid patch width in pixels
+    patch_height: int  # nominal grid patch height in pixels
 
 
 # ---------------------------------------------------------------------------
@@ -202,42 +215,49 @@ def _bmp_payload_to_pil(data: bytes, width: int, height: int) -> Image.Image:
     return Image.frombytes("RGB", (width, height), data, "raw", "BGR", stride, -1)
 
 
-def _patchify_image(
-    data: bytes,
+def _patch_boxes(
+    width: int,
+    height: int,
     patch_width: int,
     patch_height: int,
-) -> Tuple[List[bytes], int, int]:
-    """Split one image into raster-ordered, header-free BMP pixel arrays.
+) -> List[Tuple[int, int, int, int]]:
+    """Raster-ordered ``(x, y, width, height)`` of the patches covering an image.
 
-    The image is padded on the right/bottom to a multiple of the requested
-    rectangle; each patch uses BMP's BGR/bottom-up/aligned-row layout but
-    contains no BMP or DIB header. Returns
-    ``(patch_datas, orig_width, orig_height)``.
+    Edge patches are *clipped* to the image rather than padded out to the
+    nominal rectangle, so the patches partition exactly the source pixels. This
+    is the single definition of the patch grid: splitting and reassembly both
+    read it, so they cannot disagree.
     """
-    with Image.open(io.BytesIO(data)) as source:
-        image = source.convert("RGB")
-    orig_width, orig_height = image.size
-
+    if width <= 0 or height <= 0:
+        raise ValueError(f"image dimensions must be positive, got {width}x{height}")
     if patch_width <= 0 or patch_height <= 0:
         raise ValueError(
             "image patch dimensions must be positive, got "
             f"{patch_width}x{patch_height}")
+    return [
+        (x, y, min(patch_width, width - x), min(patch_height, height - y))
+        for y in range(0, height, patch_height)
+        for x in range(0, width, patch_width)
+    ]
 
-    padded_width = (
-        (orig_width + patch_width - 1) // patch_width) * patch_width
-    padded_height = (
-        (orig_height + patch_height - 1) // patch_height) * patch_height
 
-    padded = Image.new("RGB", (padded_width, padded_height))
-    padded.paste(image, (0, 0))
+def patchify_pil_image(
+    image: Image.Image,
+    patch_width: int,
+    patch_height: int,
+) -> List[bytes]:
+    """Split an RGB image into raster-ordered, header-free BMP pixel arrays.
 
-    patch_datas: List[bytes] = []
-    for y in range(0, padded_height, patch_height):
-        for x in range(0, padded_width, patch_width):
-            patch = padded.crop(
-                (x, y, x + patch_width, y + patch_height))
-            patch_datas.append(_pil_to_bmp_payload(patch))
-    return patch_datas, orig_width, orig_height
+    Because edge patches are clipped (see :func:`_patch_boxes`), the payloads
+    concatenate to exactly the source pixels: no invented bytes are compressed
+    and the total is the image's true size. Each patch keeps BMP's
+    BGR/bottom-up/four-byte-aligned row layout but carries no BMP or DIB header.
+    """
+    width, height = image.size
+    return [
+        _pil_to_bmp_payload(image.crop((x, y, x + w, y + h)))
+        for x, y, w, h in _patch_boxes(width, height, patch_width, patch_height)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -254,14 +274,17 @@ def patchify_images_for_compression(
 
     Pure preprocessing step — no compression logic involved. The 2D counterpart
     of ``chunk_audio_for_compression``: yields BMP-compatible pixel payloads
-    without repeating a BMP header for every patch. The dimensions are explicit
-    because RAC payloads may be rectangular rather than square.
+    without repeating a BMP header for every patch, and — like the audio
+    chunker's short final chunk — clips edge patches to the image so the
+    payloads sum to exactly the image's own byte count. The dimensions are
+    explicit because RAC payloads may be rectangular rather than square.
     """
     all_records: List[ImagePatchRecord] = []
     for local_idx, i in enumerate(indices):
-        with open(image_files[i], "rb") as f:
-            patch_datas, orig_w, orig_h = _patchify_image(
-                f.read(), patch_width, patch_height)
+        with Image.open(image_files[i]) as source:
+            image = source.convert("RGB")
+        orig_w, orig_h = image.size
+        patch_datas = patchify_pil_image(image, patch_width, patch_height)
         for patch_idx, data in enumerate(patch_datas):
             all_records.append(ImagePatchRecord(
                 data=data, sample_idx=local_idx, patch_idx=patch_idx,
@@ -281,28 +304,17 @@ def reassemble_image_patches(
 
     The 2D analog of ``pcm_payload_to_wav`` — re-wraps header-free payload back
     into a viewable form. ``patch_datas`` must be the image's whole patch set in
-    raster order; each patch's x/y is derived from its position.
+    raster order; each patch's x/y and its clipped size are derived from its
+    position, mirroring :func:`patchify_pil_image`.
     """
-    if patch_width <= 0 or patch_height <= 0:
+    boxes = _patch_boxes(orig_width, orig_height, patch_width, patch_height)
+    if len(patch_datas) != len(boxes):
         raise ValueError(
-            "image patch dimensions must be positive, got "
-            f"{patch_width}x{patch_height}")
-    padded_width = (
-        (orig_width + patch_width - 1) // patch_width) * patch_width
-    per_row = padded_width // patch_width
-    padded_height = (
-        (orig_height + patch_height - 1) // patch_height) * patch_height
-    expected_patches = per_row * (padded_height // patch_height)
-    if len(patch_datas) != expected_patches:
-        raise ValueError(
-            f"got {len(patch_datas)} patches, expected {expected_patches} for "
-            f"a padded {padded_width}x{padded_height} image with "
+            f"got {len(patch_datas)} patches, expected {len(boxes)} for "
+            f"a {orig_width}x{orig_height} image with "
             f"{patch_width}x{patch_height} patches")
 
-    canvas = Image.new("RGB", (padded_width, padded_height))
-    for patch_idx, data in enumerate(patch_datas):
-        x = (patch_idx % per_row) * patch_width
-        y = (patch_idx // per_row) * patch_height
-        canvas.paste(
-            _bmp_payload_to_pil(data, patch_width, patch_height), (x, y))
-    return canvas.crop((0, 0, orig_width, orig_height))
+    canvas = Image.new("RGB", (orig_width, orig_height))
+    for data, (x, y, patch_w, patch_h) in zip(patch_datas, boxes):
+        canvas.paste(_bmp_payload_to_pil(data, patch_w, patch_h), (x, y))
+    return canvas

@@ -78,13 +78,17 @@ and compression ratio are micro-averages from total original and compressed
 bits, not averages of per-sample ratios.
 
 `bpb` means bits per canonical input byte. Image rows additionally report
-semantic `bpp = total_bits / (width * height)`. Use BPP for image comparisons:
-the current bGPT evaluators count padded, per-patch BMP payload bytes in their
-`original_bytes`, whereas these whole-image baselines use tight RGB8. Their
-existing BPB/ratio columns therefore have different denominators. A fair image
-table recomputes every method's rate as compressed bits divided by the original
-source image's `width * height`; total artifact bits per identical eval sample
-are also directly comparable.
+semantic `bpp = total_bits / (width * height)`.
+
+Image patches are clipped to the source image rather than padded out to the
+nominal rectangle, so the bGPT evaluators' `original_bytes` is the image's own
+byte count and shares a denominator with these whole-image baselines. The one
+residual difference is BMP's four-byte row alignment, which adds padding only
+when a patch column's width is not a multiple of four pixels; it is zero for
+every currently used geometry. Prefer BPP for image tables regardless, and
+build them with `scripts/collect_results.py`, which puts every method on the
+source image's `width * height` and reports the padding share it had to
+account for.
 
 The main track follows the repository convention that sample metadata is
 benchmark-shared: generic/delta codecs and bGPT do not pay separately for image

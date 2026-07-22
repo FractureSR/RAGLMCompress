@@ -133,8 +133,10 @@ def _image_worker(
 
     # ── 2. Auto-select batch size ─────────────────────────────────────────────
     # Include the free header when probing the model's actual sequence length.
+    # Edge patches are clipped, so probe with the longest patch in the shard.
     rep_lens = [
-        len(free_context_header("bmp")) + len(all_patches[0].data)
+        len(free_context_header("bmp"))
+        + max(len(patch.data) for patch in all_patches)
     ] if all_patches else []
     batch_size = auto_batch_size(
         _bgpt_probe_factory(model, device, "bmp"), device, rep_lens,

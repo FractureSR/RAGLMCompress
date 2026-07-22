@@ -332,21 +332,13 @@ def _query_for_retriever(
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("canonical image sample has invalid dimensions") from exc
         from PIL import Image
-        from utils.img_utils import _pil_to_bmp_payload
+        from utils.img_utils import patchify_pil_image
 
         try:
             image = Image.frombytes("RGB", (width, height), data)
         except ValueError as exc:
             raise ValueError("canonical image payload does not match its dimensions") from exc
-        padded_width = ((width + patch_width - 1) // patch_width) * patch_width
-        padded_height = ((height + patch_height - 1) // patch_height) * patch_height
-        padded = Image.new("RGB", (padded_width, padded_height))
-        padded.paste(image, (0, 0))
-        query_parts = []
-        for y in range(0, padded_height, patch_height):
-            for x in range(0, padded_width, patch_width):
-                patch = padded.crop((x, y, x + patch_width, y + patch_height))
-                query_parts.append(_pil_to_bmp_payload(patch))
+        query_parts = patchify_pil_image(image, patch_width, patch_height)
         if not query_parts:
             raise ValueError("image retrieval query produced no patches")
         return b"".join(query_parts)
