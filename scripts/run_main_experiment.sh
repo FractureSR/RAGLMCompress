@@ -32,6 +32,10 @@ set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+PROJ_HOME=$HOME/projects/RAGLMCompress
+
+export PATH="$PROJ_HOME/baseline_coders/flac-1.4.3/_install/bin:$PROJ_HOME/baseline_coders/bsdiff:$PROJ_HOME/baseline_coders/cmix:$PROJ_HOME/baseline_coders/openzl:$PROJ_HOME/baseline_coders/libjxl/build/tools:$PATH"
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -40,23 +44,27 @@ OUT_DIR=${OUT_DIR:-results/main}
 LLM_MODEL=${LLM_MODEL:-pretrained/SmolLM2-135M}
 BGPT_IMAGE_MODEL=${BGPT_IMAGE_MODEL:-pretrained/bgpt/weights-image.pth}
 BGPT_AUDIO_MODEL=${BGPT_AUDIO_MODEL:-pretrained/bgpt/weights-audio.pth}
-DEVICE=${DEVICE:-cuda:0}
+DEVICE=${DEVICE:-cuda:2,cuda:3}
 SEED=${SEED:-42}
-M=${M:-16}                       # retrieval candidates the oracle tries per piece
-BASE_FRAC=${BASE_FRAC:-0.5}
+M=${M:-4}                       # retrieval candidates the oracle tries per piece
+BASE_FRAC=${BASE_FRAC:-0.4}
+
+# Everything below is a *modality* default.  Any of these settings can be
+# overridden for a single dataset in the per-dataset table further down, so
+# datasets of the same modality need not share corpus sizes or geometry.
 
 # Corpus sizes.  PREP_* is what gets split into base+held-out; N_* is how many
 # held-out samples every method is scored on; CALIB_* is the index-calibration
 # tail excluded from all test sets.
 TEXT_PREP_DOCS=${TEXT_PREP_DOCS:-300}
-TEXT_N_DOCS=${TEXT_N_DOCS:-100}
-TEXT_CALIB_DOCS=${TEXT_CALIB_DOCS:-10}
-IMAGE_PREP_SAMPLES=${IMAGE_PREP_SAMPLES:-2000}
-IMAGE_N_SAMPLES=${IMAGE_N_SAMPLES:-200}
-IMAGE_CALIB_SAMPLES=${IMAGE_CALIB_SAMPLES:-20}
-AUDIO_PREP_SAMPLES=${AUDIO_PREP_SAMPLES:-200}
-AUDIO_N_SAMPLES=${AUDIO_N_SAMPLES:-50}
-AUDIO_CALIB_SAMPLES=${AUDIO_CALIB_SAMPLES:-10}
+TEXT_N_DOCS=${TEXT_N_DOCS:-150}
+TEXT_CALIB_DOCS=${TEXT_CALIB_DOCS:-30}
+IMAGE_PREP_SAMPLES=${IMAGE_PREP_SAMPLES:-1000}
+IMAGE_N_SAMPLES=${IMAGE_N_SAMPLES:-500}
+IMAGE_CALIB_SAMPLES=${IMAGE_CALIB_SAMPLES:-100}
+AUDIO_PREP_SAMPLES=${AUDIO_PREP_SAMPLES:-700}
+AUDIO_N_SAMPLES=${AUDIO_N_SAMPLES:-350}
+AUDIO_CALIB_SAMPLES=${AUDIO_CALIB_SAMPLES:-50}
 
 # Retrieval-unit / payload geometry.  See the comparability notes above; these
 # defaults keep each modality's neural baseline and RAC on a shared denominator.
@@ -78,7 +86,7 @@ IMAGE_BASE_PATCH_W=${IMAGE_BASE_PATCH_W:-32}     # no-condition bGPT 32x32 = 307
 IMAGE_BASE_PATCH_H=${IMAGE_BASE_PATCH_H:-32}
 AUDIO_CHUNK_BYTES=${AUDIO_CHUNK_BYTES:-512}      # one condition = 512 PCM bytes
 AUDIO_KGRAM=${AUDIO_KGRAM:-8}
-IMAGE_KGRAM=${IMAGE_KGRAM:-4}
+IMAGE_KGRAM=${IMAGE_KGRAM:-8}
 
 # Conventional codecs.  cmix is excluded by default: it is orders of magnitude
 # slower than everything else here.  WITH_CMIX=1 adds it back.
@@ -99,19 +107,73 @@ if [[ "$WITH_CMIX" == "1" ]]; then
     AUDIO_CODECS="$AUDIO_CODECS,cmix"
 fi
 
-# VERIFY=1 runs each RAC config once over VERIFY_N samples *with* decoding first,
-# so roundtrip_ok is confirmed before the fast --no-decompress measurement runs.
-VERIFY=${VERIFY:-1}
-VERIFY_N=${VERIFY_N:-3}
+# This script is compress-only: every neural stage passes --no-decompress, so no
+# GPU decode round-trip runs here (that is what was OOMing on long windows). The
+# reported sizes are the honest arithmetic-coded bytes the oracle selects; to
+# confirm roundtrip_ok on a new config, run one eval_rac_* by hand on a few
+# samples *without* --no-decompress. Note the conventional codec baselines
+# (eval_baselines / eval_delta_baselines) still decode on CPU internally to
+# byte-verify — that is intrinsic to them, cheap, and never touches the GPU.
 DRY_RUN=${DRY_RUN:-0}
 SKIP_EXISTING=${SKIP_EXISTING:-1}
 
 ALL_DATASETS="arxiv_cl arxiv_ar eurlex_caselaw eurlex_regulation \
-eurosat_forest eurosat_industry medmnist_retina \
+eurosat_forest eurosat_highway medmnist_blood medmnist_retina \
 ljspeech vctk_p225"
 DATASETS=${DATASETS:-$ALL_DATASETS}
 ALL_STAGES="prepare neural rac codecs delta collect"
 STAGES=${STAGES:-$ALL_STAGES}
+
+# ---------------------------------------------------------------------------
+# Per-dataset overrides
+#
+# Define <dataset>_<SETTING> to override one modality default for one dataset;
+# anything left undefined falls back to the modality value above.  These are
+# ordinary variables, so the environment can set them too:
+#
+#     medmnist_retina_N_SAMPLES=120 scripts/run_main_experiment.sh
+#
+# Settings available per dataset:
+#   text   PREP_DOCS N_DOCS CALIB_DOCS CHUNK_TOKENS BASELINE_TOKENS
+#   image  PREP_SAMPLES N_SAMPLES CALIB_SAMPLES KGRAM
+#          COND_W COND_H PAYLOAD_W PAYLOAD_H BASE_PATCH_W BASE_PATCH_H
+#   audio  PREP_SAMPLES N_SAMPLES CALIB_SAMPLES CHUNK_BYTES KGRAM
+#   any    BASE_FRAC M CODECS
+# ---------------------------------------------------------------------------
+
+# retinamnist's test split holds only ~400 images, so its held-out half is ~200.
+# N + CALIB must fit inside it: otherwise eval_bgpt scores N samples while the
+# RAC evaluators carve the calibration tail out of a shorter prefix and score
+# fewer, and the two rows stop describing the same images.
+# medmnist_retina_PREP_SAMPLES=${medmnist_retina_PREP_SAMPLES:-1000}
+# medmnist_retina_N_SAMPLES=${medmnist_retina_N_SAMPLES:-500}
+# medmnist_retina_CALIB_SAMPLES=${medmnist_retina_CALIB_SAMPLES:-100}
+
+# EUR-Lex documents are far shorter than arXiv TeX sources, so more of them fit
+# in a comparable corpus. Tune once you have seen the real document lengths
+# (scripts/probe_dataset.py reports them).
+eurlex_caselaw_PREP_DOCS=1000
+eurlex_caselaw_N_DOCS=500
+eurlex_caselaw_CALIB_DOCS=100
+eurlex_regulation_PREP_DOCS=1000
+eurlex_regulation_N_DOCS=500
+eurlex_regulation_CALIB_DOCS=100
+
+# VCTK p225 is one speaker with many short clips; LJSpeech clips are longer.
+vctk_p225_PREP_SAMPLES=200
+vctk_p225_N_SAMPLES=100
+vctk_p225_CALIB_SAMPLES=20
+
+# Resolve one setting for the dataset being run: the <dataset>_<KEY> override if
+# it is defined and non-empty, else the modality default named by <FALLBACK>.
+setting() {   # setting <dataset> <KEY> <FALLBACK_VAR>
+    local override="${1}_${2}"
+    if [[ -n "${!override:-}" ]]; then
+        printf '%s' "${!override}"
+    else
+        printf '%s' "${!3}"
+    fi
+}
 
 mkdir -p "$OUT_DIR"
 SUMMARY="$OUT_DIR/run_summary.tsv"
@@ -125,7 +187,7 @@ STEPS_SKIPPED=0
 dataset_modality() {
     case "$1" in
         arxiv_cl|arxiv_ar|eurlex_caselaw|eurlex_regulation) echo text ;;
-        eurosat_forest|eurosat_industry|medmnist_retina) echo image ;;
+        eurosat_forest|eurosat_highway|medmnist_blood|medmnist_retina) echo image ;;
         ljspeech|vctk_p225) echo audio ;;
         *) echo "unknown" ;;
     esac
@@ -138,10 +200,11 @@ dataset_path() {
         eurlex_caselaw)     echo "$DATA_DIR/eurlex/caselaw.jsonl" ;;
         eurlex_regulation)  echo "$DATA_DIR/eurlex/regulation.jsonl" ;;
         eurosat_forest)     echo "$DATA_DIR/eurosat/Forest" ;;
-        eurosat_industry)   echo "$DATA_DIR/eurosat/Industry" ;;
+        eurosat_highway)    echo "$DATA_DIR/eurosat/Highway" ;;
         # The registered loader names the test split explicitly, so the
         # dataset path has to include it (utils/img_utils.py).
-        medmnist_retina)    echo "$DATA_DIR/medmnist/retinamnist128/test" ;;
+        medmnist_blood)     echo "$DATA_DIR/medmnist/bloodmnist_128/train" ;;
+        medmnist_retina)    echo "$DATA_DIR/medmnist/retinamnist_128/train" ;;
         ljspeech)           echo "$DATA_DIR/ljspeech_wav" ;;
         vctk_p225)          echo "$DATA_DIR/vctk/p225" ;;
         *)                  echo "" ;;
@@ -283,13 +346,25 @@ run_text() {
     local root="$OUT_DIR/$dataset" db="$OUT_DIR/$dataset/db" csv="$OUT_DIR/$dataset/csv"
     mkdir -p "$csv"
 
+    local prep_docs n_docs calib_docs chunk_tokens baseline_tokens base_frac m codecs
+    prep_docs=$(setting "$dataset" PREP_DOCS TEXT_PREP_DOCS)
+    n_docs=$(setting "$dataset" N_DOCS TEXT_N_DOCS)
+    calib_docs=$(setting "$dataset" CALIB_DOCS TEXT_CALIB_DOCS)
+    chunk_tokens=$(setting "$dataset" CHUNK_TOKENS TEXT_CHUNK_TOKENS)
+    baseline_tokens=$(setting "$dataset" BASELINE_TOKENS TEXT_BASELINE_TOKENS)
+    base_frac=$(setting "$dataset" BASE_FRAC BASE_FRAC)
+    m=$(setting "$dataset" M M)
+    codecs=$(setting "$dataset" CODECS TEXT_CODECS)
+    echo "  config: prep=$prep_docs docs, test=$n_docs, calib=$calib_docs," \
+         "condition=$chunk_tokens tok, baseline window=$baseline_tokens tok, m=$m"
+
     if stage_enabled prepare; then
         run_step "$dataset" prepare "$db/meta.json" \
             python utils/prepare_rac_data_llm.py \
                 --dataset "$source_path" \
-                --n-docs "$TEXT_PREP_DOCS" \
-                --base-frac "$BASE_FRAC" \
-                --chunk-size "$TEXT_CHUNK_TOKENS" --chunk-overlap 0 \
+                --n-docs "$prep_docs" \
+                --base-frac "$base_frac" \
+                --chunk-size "$chunk_tokens" --chunk-overlap 0 \
                 --retriever bm25 \
                 --seed "$SEED" \
                 --model "$LLM_MODEL" \
@@ -306,38 +381,31 @@ run_text() {
             python evaluation/eval_llm.py \
                 --dataset "$db/eval_docs.jsonl" \
                 --model "$LLM_MODEL" \
-                --n-docs "$TEXT_N_DOCS" \
-                --max-tokens "$TEXT_BASELINE_TOKENS" \
+                --n-docs "$n_docs" \
+                --max-tokens "$baseline_tokens" \
                 --device "$DEVICE" \
                 --no-decompress \
                 --output "$csv/llm_baseline.csv"
     fi
 
     if stage_enabled rac; then
-        if [[ "$VERIFY" == "1" ]]; then
-            run_step "$dataset" rac_verify "$root/logs/rac_verify.done" \
-                python evaluation/eval_rac_llm.py \
-                    --database "$db" --model "$LLM_MODEL" \
-                    --n-docs "$VERIFY_N" --m "$M" \
-                    --device "$DEVICE"
-        fi
         run_step "$dataset" rac_fixed "$csv/rac_fixed.csv" \
             python evaluation/eval_rac_llm.py \
                 --database "$db" --model "$LLM_MODEL" \
-                --n-docs "$TEXT_N_DOCS" --calib-docs "$TEXT_CALIB_DOCS" --m "$M" \
+                --n-docs "$n_docs" --calib-docs "$calib_docs" --m "$m" \
                 --device "$DEVICE" --no-decompress \
                 --output "$csv/rac_fixed.csv"
         run_step "$dataset" rac_calibrated "$csv/rac_calibrated.csv" \
             python evaluation/eval_rac_llm.py \
                 --database "$db" --model "$LLM_MODEL" \
-                --n-docs "$TEXT_N_DOCS" --calib-docs "$TEXT_CALIB_DOCS" --m "$M" \
+                --n-docs "$n_docs" --calib-docs "$calib_docs" --m "$m" \
                 --calibrate --save-index "$root/index_calibrated.json" \
                 --device "$DEVICE" --no-decompress \
                 --output "$csv/rac_calibrated.csv"
     fi
 
     run_conventional "$dataset" text "$db" "$csv" \
-        "$TEXT_CODECS" "$TEXT_N_DOCS" "$TEXT_CALIB_DOCS"
+        "$codecs" "$n_docs" "$calib_docs" "$m"
 }
 
 run_image() {
@@ -345,15 +413,56 @@ run_image() {
     local db="$OUT_DIR/$dataset/db" csv="$OUT_DIR/$dataset/csv"
     mkdir -p "$csv"
 
+    local prep n_samples calib kgram base_frac m codecs
+    local cond_w cond_h payload_w payload_h base_w base_h
+    prep=$(setting "$dataset" PREP_SAMPLES IMAGE_PREP_SAMPLES)
+    n_samples=$(setting "$dataset" N_SAMPLES IMAGE_N_SAMPLES)
+    calib=$(setting "$dataset" CALIB_SAMPLES IMAGE_CALIB_SAMPLES)
+    kgram=$(setting "$dataset" KGRAM IMAGE_KGRAM)
+    base_frac=$(setting "$dataset" BASE_FRAC BASE_FRAC)
+    m=$(setting "$dataset" M M)
+    codecs=$(setting "$dataset" CODECS IMAGE_CODECS)
+    cond_w=$(setting "$dataset" COND_W IMAGE_COND_W)
+    cond_h=$(setting "$dataset" COND_H IMAGE_COND_H)
+    payload_w=$(setting "$dataset" PAYLOAD_W IMAGE_PAYLOAD_W)
+    payload_h=$(setting "$dataset" PAYLOAD_H IMAGE_PAYLOAD_H)
+    base_w=$(setting "$dataset" BASE_PATCH_W IMAGE_BASE_PATCH_W)
+    base_h=$(setting "$dataset" BASE_PATCH_H IMAGE_BASE_PATCH_H)
+    echo "  config: prep=$prep imgs, test=$n_samples, calib=$calib, m=$m," \
+         "condition=${cond_w}x${cond_h}, payload=${payload_w}x${payload_h}," \
+         "baseline patch=${base_w}x${base_h}"
+    # Condition + payload must fill one bGPT image body exactly, or
+    # eval_rac_bgpt rejects the rectangle. Catch a bad override before prepare.
+    if ! python -c "
+import sys
+sys.path.insert(0, '.')
+from compression.bgpt_compressor import IMAGE_BODY_BYTES
+from utils.img_utils import bmp_payload_nbytes
+cond = bmp_payload_nbytes($cond_w, $cond_h)
+payload = bmp_payload_nbytes($payload_w, $payload_h)
+base = bmp_payload_nbytes($base_w, $base_h)
+ok = True
+if cond + payload != IMAGE_BODY_BYTES:
+    print(f'  condition {cond} B + payload {payload} B = {cond+payload} B != '
+          f'{IMAGE_BODY_BYTES} B image body'); ok = False
+if base != IMAGE_BODY_BYTES:
+    print(f'  baseline patch {base} B != {IMAGE_BODY_BYTES} B image body'); ok = False
+raise SystemExit(0 if ok else 1)
+"; then
+        echo "  [FAIL] $dataset: image geometry does not fill the bGPT body"
+        FAILURES=$((FAILURES + 1))
+        return 1
+    fi
+
     if stage_enabled prepare; then
         run_step "$dataset" prepare "$db/meta.json" \
             python utils/prepare_rac_data_bgpt.py \
                 --dataset "$source_path" --modality image \
-                --n-samples "$IMAGE_PREP_SAMPLES" \
-                --base-frac "$BASE_FRAC" \
-                --image-patch-width "$IMAGE_COND_W" \
-                --image-patch-height "$IMAGE_COND_H" \
-                --retriever bm25 --kgram "$IMAGE_KGRAM" \
+                --n-samples "$prep" \
+                --base-frac "$base_frac" \
+                --image-patch-width "$cond_w" \
+                --image-patch-height "$cond_h" \
+                --retriever bm25 --kgram "$kgram" \
                 --seed "$SEED" \
                 --out "$db" || return 1
     fi
@@ -368,47 +477,38 @@ run_image() {
                 --modality image \
                 --dataset "$db/eval_samples.pkl" \
                 --model "$BGPT_IMAGE_MODEL" \
-                --n-samples "$IMAGE_N_SAMPLES" \
-                --image-patch-width "$IMAGE_BASE_PATCH_W" \
-                --image-patch-height "$IMAGE_BASE_PATCH_H" \
+                --n-samples "$n_samples" \
+                --image-patch-width "$base_w" \
+                --image-patch-height "$base_h" \
                 --device "$DEVICE" --no-decompress \
                 --output "$csv/bgpt_baseline.csv"
     fi
 
     if stage_enabled rac; then
         local root="$OUT_DIR/$dataset"
-        if [[ "$VERIFY" == "1" ]]; then
-            run_step "$dataset" rac_verify "$root/logs/rac_verify.done" \
-                python evaluation/eval_rac_bgpt.py \
-                    --database "$db" --model "$BGPT_IMAGE_MODEL" \
-                    --n-samples "$VERIFY_N" --m "$M" \
-                    --image-payload-width "$IMAGE_PAYLOAD_W" \
-                    --image-payload-height "$IMAGE_PAYLOAD_H" \
-                    --device "$DEVICE"
-        fi
         run_step "$dataset" rac_fixed "$csv/rac_fixed.csv" \
             python evaluation/eval_rac_bgpt.py \
                 --database "$db" --model "$BGPT_IMAGE_MODEL" \
-                --n-samples "$IMAGE_N_SAMPLES" --calib-samples "$IMAGE_CALIB_SAMPLES" \
-                --m "$M" \
-                --image-payload-width "$IMAGE_PAYLOAD_W" \
-                --image-payload-height "$IMAGE_PAYLOAD_H" \
+                --n-samples "$n_samples" --calib-samples "$calib" \
+                --m "$m" \
+                --image-payload-width "$payload_w" \
+                --image-payload-height "$payload_h" \
                 --device "$DEVICE" --no-decompress \
                 --output "$csv/rac_fixed.csv"
         run_step "$dataset" rac_calibrated "$csv/rac_calibrated.csv" \
             python evaluation/eval_rac_bgpt.py \
                 --database "$db" --model "$BGPT_IMAGE_MODEL" \
-                --n-samples "$IMAGE_N_SAMPLES" --calib-samples "$IMAGE_CALIB_SAMPLES" \
-                --m "$M" \
-                --image-payload-width "$IMAGE_PAYLOAD_W" \
-                --image-payload-height "$IMAGE_PAYLOAD_H" \
+                --n-samples "$n_samples" --calib-samples "$calib" \
+                --m "$m" \
+                --image-payload-width "$payload_w" \
+                --image-payload-height "$payload_h" \
                 --calibrate --save-index "$OUT_DIR/$dataset/index_calibrated.json" \
                 --device "$DEVICE" --no-decompress \
                 --output "$csv/rac_calibrated.csv"
     fi
 
     run_conventional "$dataset" image "$db" "$csv" \
-        "$IMAGE_CODECS" "$IMAGE_N_SAMPLES" "$IMAGE_CALIB_SAMPLES"
+        "$codecs" "$n_samples" "$calib" "$m"
 }
 
 run_audio() {
@@ -416,14 +516,26 @@ run_audio() {
     local db="$OUT_DIR/$dataset/db" csv="$OUT_DIR/$dataset/csv"
     mkdir -p "$csv"
 
+    local prep n_samples calib chunk_bytes kgram base_frac m codecs
+    prep=$(setting "$dataset" PREP_SAMPLES AUDIO_PREP_SAMPLES)
+    n_samples=$(setting "$dataset" N_SAMPLES AUDIO_N_SAMPLES)
+    calib=$(setting "$dataset" CALIB_SAMPLES AUDIO_CALIB_SAMPLES)
+    chunk_bytes=$(setting "$dataset" CHUNK_BYTES AUDIO_CHUNK_BYTES)
+    kgram=$(setting "$dataset" KGRAM AUDIO_KGRAM)
+    base_frac=$(setting "$dataset" BASE_FRAC BASE_FRAC)
+    m=$(setting "$dataset" M M)
+    codecs=$(setting "$dataset" CODECS AUDIO_CODECS)
+    echo "  config: prep=$prep clips, test=$n_samples, calib=$calib," \
+         "condition=$chunk_bytes B, kgram=$kgram, m=$m"
+
     if stage_enabled prepare; then
         run_step "$dataset" prepare "$db/meta.json" \
             python utils/prepare_rac_data_bgpt.py \
                 --dataset "$source_path" --modality audio \
-                --n-samples "$AUDIO_PREP_SAMPLES" \
-                --base-frac "$BASE_FRAC" \
-                --audio-chunk-bytes "$AUDIO_CHUNK_BYTES" \
-                --retriever bm25 --kgram "$AUDIO_KGRAM" \
+                --n-samples "$prep" \
+                --base-frac "$base_frac" \
+                --audio-chunk-bytes "$chunk_bytes" \
+                --retriever bm25 --kgram "$kgram" \
                 --seed "$SEED" \
                 --out "$db" || return 1
     fi
@@ -438,44 +550,37 @@ run_audio() {
                 --modality audio \
                 --dataset "$db/eval_samples.pkl" \
                 --model "$BGPT_AUDIO_MODEL" \
-                --n-samples "$AUDIO_N_SAMPLES" \
+                --n-samples "$n_samples" \
                 --device "$DEVICE" --no-decompress \
                 --output "$csv/bgpt_baseline.csv"
     fi
 
     if stage_enabled rac; then
         local root="$OUT_DIR/$dataset"
-        if [[ "$VERIFY" == "1" ]]; then
-            run_step "$dataset" rac_verify "$root/logs/rac_verify.done" \
-                python evaluation/eval_rac_bgpt.py \
-                    --database "$db" --model "$BGPT_AUDIO_MODEL" \
-                    --n-samples "$VERIFY_N" --m "$M" \
-                    --device "$DEVICE"
-        fi
         run_step "$dataset" rac_fixed "$csv/rac_fixed.csv" \
             python evaluation/eval_rac_bgpt.py \
                 --database "$db" --model "$BGPT_AUDIO_MODEL" \
-                --n-samples "$AUDIO_N_SAMPLES" --calib-samples "$AUDIO_CALIB_SAMPLES" \
-                --m "$M" \
+                --n-samples "$n_samples" --calib-samples "$calib" \
+                --m "$m" \
                 --device "$DEVICE" --no-decompress \
                 --output "$csv/rac_fixed.csv"
         run_step "$dataset" rac_calibrated "$csv/rac_calibrated.csv" \
             python evaluation/eval_rac_bgpt.py \
                 --database "$db" --model "$BGPT_AUDIO_MODEL" \
-                --n-samples "$AUDIO_N_SAMPLES" --calib-samples "$AUDIO_CALIB_SAMPLES" \
-                --m "$M" \
+                --n-samples "$n_samples" --calib-samples "$calib" \
+                --m "$m" \
                 --calibrate --save-index "$OUT_DIR/$dataset/index_calibrated.json" \
                 --device "$DEVICE" --no-decompress \
                 --output "$csv/rac_calibrated.csv"
     fi
 
     run_conventional "$dataset" audio "$db" "$csv" \
-        "$AUDIO_CODECS" "$AUDIO_N_SAMPLES" "$AUDIO_CALIB_SAMPLES"
+        "$codecs" "$n_samples" "$calib" "$m"
 }
 
 run_conventional() {
     # Standalone + whole-reference delta codecs, on the same test prefix.
-    local dataset=$1 modality=$2 db=$3 csv=$4 codecs=$5 n_samples=$6 calib=$7
+    local dataset=$1 modality=$2 db=$3 csv=$4 codecs=$5 n_samples=$6 calib=$7 m=$8
 
     if stage_enabled codecs; then
         run_step "$dataset" codecs "$csv/codecs.csv" \
@@ -505,7 +610,7 @@ run_conventional() {
             python evaluation/eval_delta_baselines.py \
                 --database "$db" --modality "$modality" \
                 --codecs "$DELTA_CODECS" \
-                --candidate-policy retrieve --m "$M" \
+                --candidate-policy retrieve --m "$m" \
                 --n-samples "$n_samples" --calib-samples "$calib" \
                 --keep-going \
                 --output "$csv/delta.csv"

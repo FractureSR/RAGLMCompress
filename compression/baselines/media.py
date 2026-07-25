@@ -195,9 +195,13 @@ class JPEGXLCodec(BaselineCodec):
         with tempfile.TemporaryDirectory(
             prefix="raglm-jxl-", dir=self.temp_dir
         ) as work_dir:
-            source = Path(work_dir, "source.png")
+            source = Path(work_dir, "source.ppm")
             artifact = Path(work_dir, "artifact.jxl")
-            image.save(source, format="PNG", compress_level=0)
+            # PNM (PPM for RGB, PGM for L) instead of PNG: PNM parsing is built
+            # into libjxl core, so cjxl reads it even when built without PNG
+            # support (no libpng at cmake time) — a PNG input otherwise fails with
+            # "Getting pixel data failed". PPM is raw 8-bit, so this is exact.
+            image.save(source, format="PPM")
             result = run_command(
                 (
                     self.encoder_binary,
@@ -221,7 +225,8 @@ class JPEGXLCodec(BaselineCodec):
             prefix="raglm-jxl-", dir=self.temp_dir
         ) as work_dir:
             source = Path(work_dir, "artifact.jxl")
-            output = Path(work_dir, "decoded.png")
+            # Ask djxl for PNM output too, for the same no-libpng reason as encode.
+            output = Path(work_dir, "decoded.ppm")
             source.write_bytes(encoded)
             result = run_command(
                 (

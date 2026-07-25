@@ -119,15 +119,15 @@ def load_rac_eval_samples(path: str, n: Optional[int] = None) -> List[str]:
 def load_eurosat_forest(path: str, n: Optional[int] = None) -> List[str]:
     return _load_image_dir(path, n, extensions=(".bmp",))
 
-@register_image_loader("eurosat/Industry")
-def load_eurosat_industry(path: str, n: Optional[int] = None) -> List[str]:
+@register_image_loader("eurosat/Highway")
+def load_eurosat_highway(path: str, n: Optional[int] = None) -> List[str]:
     return _load_image_dir(path, n, extensions=(".bmp",))
 
-@register_image_loader("medmnist/bloodmnist28/test")
+@register_image_loader("medmnist/bloodmnist_128/train")
 def load_eurosat_medmnist_bloodmnist28(path: str, n: Optional[int] = None) -> List[str]:
     return _load_image_dir(path, n, extensions=(".bmp",))
 
-@register_image_loader("medmnist/retinamnist128/test")
+@register_image_loader("medmnist/retinamnist_128/train")
 def load_eurosat_medmnist_retinamnist128(path: str, n: Optional[int] = None) -> List[str]:
     return _load_image_dir(path, n, extensions=(".bmp",))
 

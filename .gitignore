@@ -8,3 +8,4 @@ submit_slurm.sh
 probe_slurm_gpu.sh
 /results
 /.vscode
+/baseline_coders
